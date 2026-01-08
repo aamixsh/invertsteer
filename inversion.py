@@ -1,8 +1,12 @@
 """
-Inversion module adapted from SIP-It for inverting intervened activations.
+Inversion module adapted from SIP-It for inverting steered activations.
 
-This module implements the core SIP-It algorithm but with support for
-inverting activations that have been modified by refusal direction ablation.
+This module implements the core SIP-It algorithm for inverting hidden states
+back to prompts. It supports inverting both baseline and steered activations.
+
+Key difference from original SIP-It:
+- We invert at the steering layer (not the last layer)
+- No need to replace layer norm with identity
 """
 
 import gc
@@ -10,9 +14,8 @@ import torch
 from time import time
 from typing import List, Tuple, Optional
 from torch import Tensor
-from tqdm import tqdm
 
-from model_utils import set_seed, replace_final_norm_with_identity, restore_final_norm
+from model_utils import set_seed
 
 
 def format_token(token: str, length: int = 15) -> str:
@@ -53,7 +56,7 @@ def extract_hidden_states_iterative(
     Args:
         input_ids: Input token IDs [1, seq_len]
         model: The model
-        layer_idx: Layer to extract from
+        layer_idx: Layer to extract from (1-indexed, where 0 is embedding)
     
     Returns:
         Hidden states [seq_len, d_model]
@@ -312,19 +315,19 @@ def inversion_attack(
     verbose: bool = True,
 ) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]]]:
     """
-    Perform standard inversion attack (no intervention).
+    Perform standard inversion attack (no steering).
     
     Args:
         input_ids: Target token IDs [1, seq_len]
         model: The model
         tokenizer: The tokenizer
-        layer_idx: Layer to target
+        layer_idx: Layer to target for inversion
         lr: Learning rate
         seed: Random seed
         verbose: Whether to print progress
     
     Returns:
-        Tuple of (success, time, timesteps, times)
+        Tuple of (success, time, reconstructed_ids, times)
     """
     set_seed(seed)
     
@@ -352,7 +355,7 @@ def inversion_attack(
         print(f"Match: {match}")
         print(f"Time: {inversion_time:.2f}s")
     
-    return match, inversion_time, timesteps, times
+    return match, inversion_time, discovered_ids, times
 
 
 def inversion_attack_with_target(
@@ -368,13 +371,13 @@ def inversion_attack_with_target(
     """
     Perform inversion attack with custom target hidden states.
     
-    This is the key function for inverting intervened activations.
+    This is the key function for inverting steered activations.
     
     Args:
         h_target: Target hidden states [seq_len, d_model]
         model: The model
         tokenizer: The tokenizer
-        layer_idx: Layer to target
+        layer_idx: Layer to target for inversion
         lr: Learning rate
         seed: Random seed
         verbose: Whether to print progress
@@ -437,4 +440,3 @@ def compute_activation_mse(
     mse = torch.nn.functional.mse_loss(actual_acts, target_activations).item()
     
     return mse
-

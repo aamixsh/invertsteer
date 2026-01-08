@@ -1,13 +1,13 @@
-# Inverting Intervened Activations: Bridging Refusal Direction Ablation and Prompt Inversion
+# Inverting Steered Activations: Technical Plan
 
 ## Goal
 
-Find whether there exists a natural prompt that produces the same activations as a refusal-direction-intervened activation. In other words, can we invert an activation that has been modified to remove the refusal direction back into the prompt space?
+Investigate whether natural prompts exist that produce the same activations as steered (intervened) activations. Specifically: can we invert an activation that has been modified by steering (e.g., refusal direction) back into the prompt space?
 
 ## Background
 
 ### SIP-It (Soft Inverse Prompt Inversion)
-SIP-It is an algorithm that reconstructs prompts from hidden state activations by:
+SIP-It reconstructs prompts from hidden state activations by:
 1. Computing target hidden states at a specific layer for the original input
 2. For each token position iteratively:
    - Start with a random token embedding
@@ -16,140 +16,142 @@ SIP-It is an algorithm that reconstructs prompts from hidden state activations b
    - Repeat until convergence or finding an exact match
 3. Chain token finding across all positions for full prompt reconstruction
 
-Key insight: The algorithm uses the gradient to navigate the discrete token space efficiently, eliminating tokens that increase the loss.
-
 ### Refusal Direction
 The refusal direction method identifies a 1-dimensional subspace in activation space that mediates refusal behavior:
 1. Collect activations from harmful and harmless prompts
 2. Compute refusal direction = mean(harmful_activations) - mean(harmless_activations)
-3. Ablate this direction via: `activation' = activation - (activation · r̂) r̂`
-4. This removes the refusal signal, causing the model to comply with harmful requests
+3. Apply via activation addition: `activation' = activation + coeff * direction`
+4. This can bypass refusal (coeff < 0) or induce refusal (coeff > 0)
+
+## Architecture
+
+### Modular Steering Design
+
+The project is designed to be **steering-agnostic**. The `steering.py` module provides a unified interface for any steering method:
+
+```python
+@dataclass
+class SteeringConfig:
+    direction: Tensor  # The steering direction vector [d_model]
+    layer: int  # Layer to apply the steering
+    method: str = "actadd"  # "actadd" or "ablation"
+    coeff: float = 1.0  # Coefficient for actadd
+```
+
+This allows testing different steering approaches without changing the inversion code.
+
+### Key Design Decisions
+
+1. **Direction Extraction**: Handled by the `refusal_direction` repo, not reimplemented here. This ensures we use the well-tested, validated approach.
+
+2. **Layer Norm**: Original model kept intact (no layer norm replacement). We invert at the steering layer, not the last layer.
+
+3. **Inversion Layer**: Set equal to the steering layer. When steering is applied at layer L, we extract hidden_states[L+1] (the output after that layer).
+
+4. **Hook Reuse**: Import and use hooks from `refusal_direction/pipeline/utils/hook_utils.py` directly.
 
 ## Technical Approach
 
-### Phase 1: Extract Refusal Direction for Llama-3.2-1B-Instruct
+### Phase 1: Extract Steering Direction (External)
 
-1. Load model and tokenizer for `meta-llama/Llama-3.2-1B-Instruct`
-2. Prepare harmful instructions (from AdvBench) and harmless instructions (from Alpaca)
-3. Compute mean activations for both sets at the last token position
-4. Compute refusal direction as the normalized difference of means
-5. Select optimal layer for intervention (typically around layer 14 for smaller models, or sweep)
+Run the refusal_direction pipeline:
+```bash
+cd refusal_direction
+python -m pipeline.run_pipeline --model_path meta-llama/Llama-3.2-1B-Instruct
+```
 
-### Phase 2: Apply Intervention and Extract Activations
+This produces:
+- `pipeline/runs/Llama-3.2-1B-Instruct/direction.pt`: The direction tensor
+- `pipeline/runs/Llama-3.2-1B-Instruct/direction_metadata.json`: Layer info
 
-For a given harmful prompt:
-1. Run forward pass with refusal direction ablation hooks on all layers
-2. Extract the intervened hidden states at the inversion layer
-3. These are the "target" activations we want to invert
+### Phase 2: Apply Steering and Compare Generations
 
-### Phase 3: Invert Intervened Activations
+For each test prompt:
+1. Generate baseline output (no steering)
+2. Generate steered output (with actadd applied)
+3. Compare to validate steering effect
 
-Use the SIP-It algorithm to find a prompt that produces the intervened activations:
-1. Target the intervened hidden states (not the original ones)
-2. Run the gradient-guided token search
-3. Evaluate if the reconstructed prompt:
-   - Produces activations close to the intervened ones
-   - Has the same effect on model behavior (bypasses refusal)
+### Phase 3: Extract Activations
 
-## Key Questions to Answer
+1. Extract baseline hidden states at steering layer (iteratively per token)
+2. Extract steered hidden states at steering layer (with hooks applied)
+3. Measure activation difference
 
-1. **Feasibility**: Do prompts exist in the vocabulary space that naturally produce refusal-ablated activations?
-2. **Uniqueness**: How similar are the inverted prompts to the original harmful prompts?
-3. **Behavioral Equivalence**: Do inverted prompts actually bypass refusal like the activation intervention does?
-4. **Semantic Preservation**: Do inverted prompts preserve the semantic meaning of the original query?
+### Phase 4: Inversion
+
+1. Invert baseline activations → should recover original prompt
+2. Invert steered activations → key experiment
+3. Compare reconstruction accuracy
+
+### Phase 5: Behavioral Evaluation
+
+If steered inversion succeeds:
+1. Generate with the inverted prompt (no steering)
+2. Compare behavior to steered generation
+3. Measure if inverted prompt naturally bypasses refusal
+
+## Key Questions
+
+1. **Feasibility**: Do prompts exist that naturally produce steered activations?
+2. **Uniqueness**: How similar are inverted prompts to originals?
+3. **Behavioral Equivalence**: Do inverted prompts exhibit the same behavior as steering?
+4. **Semantic Preservation**: Is meaning preserved in inversion?
 
 ## Implementation Structure
 
 ```
 invertsteer/
-├── PLAN.md                    # This document
-├── requirements.txt           # Dependencies
-├── config.py                  # Configuration and constants
-├── model_utils.py             # Model loading and utilities
-├── refusal_direction.py       # Extract refusal direction
-├── intervention.py            # Apply activation interventions
-├── inversion.py               # Adapt SIP-It for intervened activations
-├── experiment.py              # Main experiment script
-└── evaluate.py                # Evaluation utilities
+├── config.py          # Configuration (loads direction from refusal_direction)
+├── model_utils.py     # Model loading (no layer norm modification)
+├── steering.py        # Modular steering interface (uses refusal_direction hooks)
+├── inversion.py       # SIP-It algorithm (inverts at steering layer)
+├── experiment.py      # Main experiment script
+├── evaluate.py        # Metrics and analysis
+├── environment.yml    # Conda environment
+├── requirements.txt   # Pip dependencies
+└── README.md          # Setup and usage
 ```
-
-## Challenges and Considerations
-
-### 1. Layer Selection
-- SIP-It works at a specific layer, while refusal ablation applies to all layers
-- Need to determine the optimal layer for inversion (likely the one where refusal direction is strongest)
-
-### 2. Activation Mismatch
-- Intervened activations may lie outside the natural manifold of activations producible by any prompt
-- This could cause SIP-It to fail to find an exact match
-- May need to measure the "reachability gap"
-
-### 3. Iterative vs. Holistic Hidden States
-- SIP-It uses iterative hidden states (computing hidden state after each token)
-- Intervention applies to the full-sequence forward pass
-- Need to reconcile these two approaches
-
-### 4. Computational Cost
-- SIP-It is expensive (O(vocab_size × prompt_length) forward passes)
-- May need to limit experiments to short prompts or use approximations
-
-## Proposed Experiments
-
-### Experiment 1: Baseline Inversion
-- Invert normal (non-intervened) activations from harmful prompts
-- Establish baseline accuracy of SIP-It on Llama-3.2-1B-Instruct
-
-### Experiment 2: Intervened Inversion
-- Apply refusal ablation and invert the resulting activations
-- Compare reconstruction accuracy with baseline
-
-### Experiment 3: Behavioral Evaluation
-- Test if inverted prompts actually bypass refusal
-- Compare model outputs for: original prompt, intervened activation, inverted prompt
-
-### Experiment 4: Semantic Analysis
-- Analyze semantic similarity between original and inverted prompts
-- Look for patterns in how the inversion modifies harmful queries
 
 ## Expected Outcomes
 
-1. **If inversion succeeds**: We've found natural prompts that bypass refusal, which has implications for:
-   - Jailbreak discovery
-   - Understanding the geometry of refusal in activation space
-   - Potential defense mechanisms
+### If inversion succeeds:
+- Natural prompts exist that bypass refusal without intervention
+- Implications for jailbreak discovery
+- Understanding of refusal geometry in activation space
 
-2. **If inversion fails**: This suggests that:
-   - Refusal-ablated activations are "unnatural" (not producible by any prompt)
-   - The refusal direction truly separates harmful from safe prompt activations
-   - Activation-space interventions are fundamentally different from prompt engineering
+### If inversion fails:
+- Steered activations are "unnatural" (not producible by any prompt)
+- Activation-space interventions are fundamentally different from prompt engineering
+- Steering creates out-of-distribution activations
 
-## Implementation Plan
+## Experiments
 
-### Step 1: Setup (model_utils.py, config.py)
-- Load Llama-3.2-1B-Instruct with HuggingFace
-- Define chat template and tokenization utilities
-- Configure device and data types
+### Experiment 1: Baseline Inversion Validation
+- Invert normal (non-steered) activations
+- Validate SIP-It works at intermediate layers (not just last layer)
 
-### Step 2: Refusal Direction (refusal_direction.py)
-- Load harmful/harmless datasets
-- Compute mean activations using hooks
-- Extract and save refusal direction
+### Experiment 2: Steered Inversion
+- Apply steering and invert resulting activations
+- Compare reconstruction accuracy with baseline
 
-### Step 3: Intervention (intervention.py)
-- Implement ablation hooks for HuggingFace models
-- Extract intervened activations
+### Experiment 3: Behavioral Comparison
+- Test if inverted prompts actually bypass refusal
+- Compare: original prompt, steered activation, inverted prompt
 
-### Step 4: Inversion (inversion.py)
-- Adapt SIP-It code to work with Llama-3.2-1B-Instruct
-- Support inverting arbitrary target activations
-- Handle the case where target is intervened activation
+### Experiment 4: Layer Sweep
+- Try inverting at different layers
+- Find optimal layer for reconstruction
 
-### Step 5: Experiment (experiment.py)
-- Run end-to-end pipeline
-- Collect metrics and results
+## Considerations
 
-### Step 6: Evaluation (evaluate.py)
-- Measure reconstruction accuracy
-- Test behavioral equivalence
-- Analyze results
+### Layer Selection
+- Inversion at steering layer is theoretically cleaner
+- May need to experiment with ±1 layer
 
+### Activation Manifold
+- Steered activations may lie outside natural activation manifold
+- High MSE after inversion indicates "unreachability"
+
+### Computational Cost
+- O(vocab_size × prompt_length) forward passes per inversion
+- Focus on shorter prompts initially

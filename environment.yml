@@ -1,0 +1,34 @@
+name: invertsteer
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch::pytorch>=2.0.0
+  - pytorch::pytorch-cuda=12.1
+  - numpy>=1.24.0
+  - scipy
+  - pandas
+  - matplotlib
+  - tqdm
+  - pip:
+    # Core ML libraries
+    - transformers>=4.40.0
+    - accelerate>=0.31.0
+    - safetensors
+    - tokenizers
+    - huggingface-hub
+    # Typing and utilities
+    - jaxtyping
+    - einops
+    # For refusal_direction pipeline
+    - datasets
+    - litellm
+    - openai
+    - python-dotenv
+    # Development
+    - ipython
+    - jupyter

@@ -1,5 +1,5 @@
 """
-Model loading and utility functions for Llama-3.2-1B-Instruct.
+Model loading and utility functions.
 """
 
 import torch
@@ -8,7 +8,21 @@ from typing import List, Optional
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import LLAMA32_CHAT_TEMPLATE, LLAMA32_CHAT_TEMPLATE_WITH_SYSTEM
+
+# Llama 3 chat template
+LLAMA3_CHAT_TEMPLATE = """<|start_header_id|>user<|end_header_id|>
+
+{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+
+LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM = """<|start_header_id|>system<|end_header_id|>
+
+{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
 
 
 def load_model(model_id: str, device: str = "cuda", dtype: str = "float32"):
@@ -27,6 +41,7 @@ def load_model(model_id: str, device: str = "cuda", dtype: str = "float32"):
         trust_remote_code=True,
     )
     model.eval()
+    model.requires_grad_(False)
     
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.padding_side = "left"
@@ -41,14 +56,14 @@ def format_instruction(
     system: Optional[str] = None,
     include_trailing_whitespace: bool = True
 ) -> str:
-    """Format an instruction using the Llama 3.2 chat template."""
+    """Format an instruction using the Llama 3 chat template."""
     if system is not None:
-        formatted = LLAMA32_CHAT_TEMPLATE_WITH_SYSTEM.format(
+        formatted = LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM.format(
             instruction=instruction, 
             system_prompt=system
         )
     else:
-        formatted = LLAMA32_CHAT_TEMPLATE.format(instruction=instruction)
+        formatted = LLAMA3_CHAT_TEMPLATE.format(instruction=instruction)
 
     if not include_trailing_whitespace:
         formatted = formatted.rstrip()
@@ -122,25 +137,6 @@ def get_hidden_size(model: AutoModelForCausalLM) -> int:
     return model.config.hidden_size
 
 
-def replace_final_norm_with_identity(model: AutoModelForCausalLM):
-    """
-    Replace the final layer norm with identity for SIP-It.
-    This is needed because SIP-It targets hidden states before the final norm.
-    Stores the original norm for restoration.
-    """
-    model.norm_backup = model.model.norm
-    model.model.norm = torch.nn.Identity()
-    return model
-
-
-def restore_final_norm(model: AutoModelForCausalLM):
-    """Restore the original final layer norm."""
-    if hasattr(model, 'norm_backup'):
-        model.model.norm = model.norm_backup
-        del model.norm_backup
-    return model
-
-
 def set_seed(seed: int):
     """Set random seed for reproducibility."""
     import random
@@ -156,4 +152,3 @@ def set_seed(seed: int):
     
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-

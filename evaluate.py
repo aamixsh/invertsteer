@@ -3,9 +3,7 @@ Evaluation utilities for the inversion experiment.
 """
 
 import json
-import torch
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from typing import List, Dict, Any
 
 
 def load_results(results_path: str) -> List[Dict[str, Any]]:
@@ -38,7 +36,7 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "mse_values": [],
             "times": [],
         },
-        "ablated": {
+        "steered": {
             "n_match_original": 0,
             "token_accuracies": [],
             "mse_to_target": [],
@@ -70,23 +68,23 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         if baseline_inv.get("time") is not None:
             metrics["baseline"]["times"].append(baseline_inv["time"])
         
-        # Ablated metrics
-        ablated_inv = result.get("ablated_inversion", {})
-        if ablated_inv.get("match_original"):
-            metrics["ablated"]["n_match_original"] += 1
+        # Steered metrics (support both old "ablated" and new "steered" keys)
+        steered_inv = result.get("steered_inversion", result.get("ablated_inversion", {}))
+        if steered_inv.get("match_original"):
+            metrics["steered"]["n_match_original"] += 1
         
-        if ablated_inv.get("reconstructed_ids"):
-            acc = compute_token_accuracy(original_ids, ablated_inv["reconstructed_ids"])
-            metrics["ablated"]["token_accuracies"].append(acc)
+        if steered_inv.get("reconstructed_ids"):
+            acc = compute_token_accuracy(original_ids, steered_inv["reconstructed_ids"])
+            metrics["steered"]["token_accuracies"].append(acc)
         
-        if ablated_inv.get("mse_to_target") is not None:
-            metrics["ablated"]["mse_to_target"].append(ablated_inv["mse_to_target"])
+        if steered_inv.get("mse_to_target") is not None:
+            metrics["steered"]["mse_to_target"].append(steered_inv["mse_to_target"])
         
-        if ablated_inv.get("mse_to_baseline") is not None:
-            metrics["ablated"]["mse_to_baseline"].append(ablated_inv["mse_to_baseline"])
+        if steered_inv.get("mse_to_baseline") is not None:
+            metrics["steered"]["mse_to_baseline"].append(steered_inv["mse_to_baseline"])
         
-        if ablated_inv.get("time") is not None:
-            metrics["ablated"]["times"].append(ablated_inv["time"])
+        if steered_inv.get("time") is not None:
+            metrics["steered"]["times"].append(steered_inv["time"])
         
         # Activation difference
         if result.get("activation_diff_total") is not None:
@@ -100,10 +98,10 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     metrics["baseline"]["avg_mse"] = safe_mean(metrics["baseline"]["mse_values"])
     metrics["baseline"]["avg_time"] = safe_mean(metrics["baseline"]["times"])
     
-    metrics["ablated"]["avg_token_accuracy"] = safe_mean(metrics["ablated"]["token_accuracies"])
-    metrics["ablated"]["avg_mse_to_target"] = safe_mean(metrics["ablated"]["mse_to_target"])
-    metrics["ablated"]["avg_mse_to_baseline"] = safe_mean(metrics["ablated"]["mse_to_baseline"])
-    metrics["ablated"]["avg_time"] = safe_mean(metrics["ablated"]["times"])
+    metrics["steered"]["avg_token_accuracy"] = safe_mean(metrics["steered"]["token_accuracies"])
+    metrics["steered"]["avg_mse_to_target"] = safe_mean(metrics["steered"]["mse_to_target"])
+    metrics["steered"]["avg_mse_to_baseline"] = safe_mean(metrics["steered"]["mse_to_baseline"])
+    metrics["steered"]["avg_time"] = safe_mean(metrics["steered"]["times"])
     
     metrics["avg_activation_diff"] = safe_mean(metrics["activation_diffs"])
     
@@ -151,8 +149,8 @@ def analyze_bypass_rates(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     analysis = {
         "baseline_refusing": 0,
         "baseline_complying": 0,
-        "ablated_refusing": 0,
-        "ablated_complying": 0,
+        "steered_refusing": 0,
+        "steered_complying": 0,
         "reconstructed_refusing": 0,
         "reconstructed_complying": 0,
     }
@@ -162,7 +160,8 @@ def analyze_bypass_rates(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         
         baseline_gen = result.get("baseline_generation", "")
-        ablated_gen = result.get("ablated_generation", "")
+        # Support both old "ablated" and new "steered" keys
+        steered_gen = result.get("steered_generation", result.get("ablated_generation", ""))
         recon_gen = result.get("reconstructed_prompt_generation", "")
         
         if baseline_gen:
@@ -171,11 +170,11 @@ def analyze_bypass_rates(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             else:
                 analysis["baseline_refusing"] += 1
         
-        if ablated_gen:
-            if check_refusal_bypass(ablated_gen):
-                analysis["ablated_complying"] += 1
+        if steered_gen:
+            if check_refusal_bypass(steered_gen):
+                analysis["steered_complying"] += 1
             else:
-                analysis["ablated_refusing"] += 1
+                analysis["steered_refusing"] += 1
         
         if recon_gen:
             if check_refusal_bypass(recon_gen):
@@ -186,8 +185,12 @@ def analyze_bypass_rates(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len([r for r in results if "error" not in r])
     if total > 0:
         analysis["baseline_refusal_rate"] = analysis["baseline_refusing"] / total
-        analysis["ablated_bypass_rate"] = analysis["ablated_complying"] / total
-        analysis["reconstructed_bypass_rate"] = analysis["reconstructed_complying"] / total if analysis["reconstructed_complying"] + analysis["reconstructed_refusing"] > 0 else 0.0
+        analysis["steered_bypass_rate"] = analysis["steered_complying"] / total
+        analysis["reconstructed_bypass_rate"] = (
+            analysis["reconstructed_complying"] / total 
+            if analysis["reconstructed_complying"] + analysis["reconstructed_refusing"] > 0 
+            else 0.0
+        )
     
     return analysis
 
@@ -210,19 +213,19 @@ def print_summary(results: List[Dict[str, Any]]):
     print(f"Avg MSE: {metrics['baseline']['avg_mse']:.4f}")
     print(f"Avg time: {metrics['baseline']['avg_time']:.2f}s")
     
-    print("\n--- Ablated Inversion ---")
-    print(f"Matches original: {metrics['ablated']['n_match_original']}/{metrics['n_experiments']}")
-    print(f"Avg token accuracy: {metrics['ablated']['avg_token_accuracy']:.2%}")
-    print(f"Avg MSE to target: {metrics['ablated']['avg_mse_to_target']:.4f}")
-    print(f"Avg MSE to baseline: {metrics['ablated']['avg_mse_to_baseline']:.4f}")
-    print(f"Avg time: {metrics['ablated']['avg_time']:.2f}s")
+    print("\n--- Steered Inversion ---")
+    print(f"Matches original: {metrics['steered']['n_match_original']}/{metrics['n_experiments']}")
+    print(f"Avg token accuracy: {metrics['steered']['avg_token_accuracy']:.2%}")
+    print(f"Avg MSE to target: {metrics['steered']['avg_mse_to_target']:.4f}")
+    print(f"Avg MSE to baseline: {metrics['steered']['avg_mse_to_baseline']:.4f}")
+    print(f"Avg time: {metrics['steered']['avg_time']:.2f}s")
     
     print("\n--- Activation Analysis ---")
     print(f"Avg activation diff: {metrics['avg_activation_diff']:.4f}")
     
     print("\n--- Refusal Bypass Analysis ---")
     print(f"Baseline refusal rate: {bypass.get('baseline_refusal_rate', 0):.2%}")
-    print(f"Ablated bypass rate: {bypass.get('ablated_bypass_rate', 0):.2%}")
+    print(f"Steered bypass rate: {bypass.get('steered_bypass_rate', 0):.2%}")
     print(f"Reconstructed bypass rate: {bypass.get('reconstructed_bypass_rate', 0):.2%}")
 
 
@@ -242,7 +245,7 @@ def compare_prompts(results: List[Dict[str, Any]], tokenizer):
         original = tokenizer.decode(result.get("original_ids", []))
         
         baseline_inv = result.get("baseline_inversion", {})
-        ablated_inv = result.get("ablated_inversion", {})
+        steered_inv = result.get("steered_inversion", result.get("ablated_inversion", {}))
         
         print(f"  Original tokens: {len(result.get('original_ids', []))}")
         
@@ -254,13 +257,13 @@ def compare_prompts(results: List[Dict[str, Any]], tokenizer):
                 print(f"    Original:      {original[:80]}...")
                 print(f"    Reconstructed: {baseline_recon[:80]}...")
         
-        if ablated_inv.get("reconstructed_ids"):
-            ablated_recon = tokenizer.decode(ablated_inv["reconstructed_ids"])
-            ablated_match = ablated_inv.get("match_original", False)
-            print(f"  Ablated recon:   {'✓ MATCH' if ablated_match else '✗ DIFFER'}")
-            if not ablated_match:
+        if steered_inv.get("reconstructed_ids"):
+            steered_recon = tokenizer.decode(steered_inv["reconstructed_ids"])
+            steered_match = steered_inv.get("match_original", False)
+            print(f"  Steered recon:   {'✓ MATCH' if steered_match else '✗ DIFFER'}")
+            if not steered_match:
                 print(f"    Original:      {original[:80]}...")
-                print(f"    Reconstructed: {ablated_recon[:80]}...")
+                print(f"    Reconstructed: {steered_recon[:80]}...")
 
 
 if __name__ == "__main__":
@@ -272,4 +275,3 @@ if __name__ == "__main__":
     
     results = load_results(args.results_file)
     print_summary(results)
-
