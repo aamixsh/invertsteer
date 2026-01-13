@@ -57,9 +57,30 @@ This will save artifacts to `pipeline/runs/Llama-3.2-1B-Instruct/`, including:
 
 ## Usage
 
+### Standalone Inversion Script
+
+The simplest way to test inversion is using `sipit.py`:
+
+```bash
+# Basic inversion
+python sipit.py --prompt "Hello, how are you?"
+
+# Without chat template (only BOS token for Llama)
+python sipit.py --prompt "Hello" --no-chat-template
+
+# Continue even if some tokens fail (use ground truth for failed positions)
+python sipit.py --prompt "Test prompt" --continue-on-failure
+
+# Track top-k candidates per position
+python sipit.py --prompt "Hello" --top-k 10
+
+# Use a different model
+python sipit.py --prompt "Hello" --model openai-community/gpt2
+```
+
 ### Quick Demo
 
-Test that everything works:
+Test the full pipeline:
 
 ```bash
 python experiment.py --demo
@@ -81,25 +102,75 @@ python experiment.py \
     --method actadd \
     --coeff 1.0 \
     --lr 1.0 \
-    --seed 42
+    --seed 42 \
+    --no-chat-template \
+    --continue-on-failure \
+    --top-k 10
 ```
 
-- `--model`: HuggingFace model path
-- `--device`: Device to use (cuda, cuda:0, cpu)
-- `--direction`: Path to direction.pt file
-- `--method`: Steering method (`actadd` or `ablation`)
-- `--coeff`: Steering coefficient (use -1 to remove direction, +1 to add)
-- `--lr`: Learning rate for SIP-It inversion
-- `--seed`: Random seed
+| Option | Description |
+|--------|-------------|
+| `--model` | HuggingFace model path |
+| `--device` | Device to use (cuda, cuda:0, cpu) |
+| `--direction` | Path to direction.pt file |
+| `--method` | Steering method (`actadd` or `ablation`) |
+| `--coeff` | Steering coefficient (use -1 to remove direction, +1 to add) |
+| `--lr` | Learning rate for SIP-It inversion |
+| `--seed` | Random seed |
+| `--no-chat-template` | Don't use chat template, only BOS token (e.g., `<\|begin_of_text\|>` for Llama) |
+| `--continue-on-failure` | Continue inversion with ground truth when a token fails |
+| `--top-k` | Number of top candidate tokens to track per position (default: 10) |
+
+## Key Features
+
+### Top-K Token Tracking
+
+During inversion, the algorithm tracks the top-k closest tokens at each position. This is useful for:
+- Understanding which tokens are "close" to the target
+- Debugging failed inversions
+- Analyzing the embedding space structure
+
+Even if inversion fails, you can see what candidates were considered:
+
+```python
+from inversion import print_top_k_tokens
+
+result = inversion_attack(...)
+print_top_k_tokens(result, tokenizer, original_ids)
+```
+
+### Continue on Failure
+
+When `--continue-on-failure` is enabled:
+- If inversion fails at a token position, the ground truth token is used
+- Inversion continues for subsequent tokens
+- Failed positions are tracked in the result
+
+This is useful for understanding partial inversion success.
+
+### No Chat Template Mode
+
+For Llama models, there are two modes:
+
+1. **With chat template** (default): Uses the full chat template tokens
+   - `<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}...`
+   - Special tokens: `[128000, 128006, 882, 128007, 271]`
+
+2. **Without chat template** (`--no-chat-template`): Only uses BOS token
+   - `<|begin_of_text|>{prompt}`
+   - Special tokens: `[128000]`
+
+This is useful for testing raw prompt inversion without chat formatting.
 
 ## Project Structure
 
 ```
 invertsteer/
 ├── config.py          # Configuration and constants
-├── model_utils.py     # Model loading utilities
+├── model_utils.py     # Model loading and tokenization utilities
 ├── steering.py        # Modular steering abstraction (uses refusal_direction hooks)
-├── inversion.py       # SIP-It inversion algorithm
+├── inversion.py       # SIP-It inversion algorithm (core implementation)
+├── sipit.py           # Standalone inversion script
 ├── experiment.py      # Main experiment script
 ├── evaluate.py        # Evaluation utilities
 ├── environment.yml    # Conda environment
@@ -135,6 +206,34 @@ The SIP-It algorithm finds a prompt by iteratively:
 - Inversion targets the same layer (hidden_states[layer+1] after that layer processes)
 - No layer norm replacement needed (unlike original SIP-It which inverts from last layer)
 
+## Return Types
+
+### InversionResult
+
+```python
+@dataclass
+class InversionResult:
+    success: bool                           # Whether all tokens were found
+    total_time: Optional[float]             # Total inversion time
+    discovered_ids: Optional[List[int]]     # Found token IDs
+    timesteps: Optional[List[int]]          # Steps per token
+    times: Optional[List[float]]            # Time per token
+    top_k_per_position: List[List[Tuple[int, float]]]  # Top-k tokens per position
+    failed_positions: List[int]             # Positions where inversion failed
+```
+
+### TokenSearchResult
+
+```python
+@dataclass
+class TokenSearchResult:
+    token_id: Optional[int]                 # Found token ID
+    embedding: Optional[Tensor]             # Token embedding
+    timesteps: int                          # Steps taken
+    top_k_tokens: List[Tuple[int, float]]   # Top-k candidates (token_id, loss)
+    success: bool                           # Whether token was found
+```
+
 ## Expected Outcomes
 
 ### If inversion succeeds:
@@ -144,6 +243,7 @@ The SIP-It algorithm finds a prompt by iteratively:
 ### If inversion fails:
 - Steered activations are "unnatural" (not producible by any prompt)
 - Activation-space interventions are fundamentally different from prompt engineering
+- Use `--continue-on-failure` to see partial results
 
 ## Dependencies
 
@@ -161,5 +261,11 @@ If you use this code, please cite the relevant papers:
   author={Arditi, Andy and Obeso, Oscar and Syed, Aaquib and Paleka, Daniel and Panickssery, Nina and Gurnee, Wes and Nanda, Neel},
   journal={arXiv preprint arXiv:2406.11717},
   year={2024}
+}
+@article{nikolaou2025language,
+  title={Language models are injective and hence invertible},
+  author={Nikolaou, Giorgos and Mencattini, Tommaso and Crisostomi, Donato and Santilli, Andrea and Panagakis, Yannis and Rodol{\`a}, Emanuele},
+  journal={arXiv preprint arXiv:2510.15511},
+  year={2025}
 }
 ```

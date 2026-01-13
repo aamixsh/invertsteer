@@ -1,21 +1,38 @@
 """
-Inversion module adapted from SIP-It for inverting steered activations.
+Inversion module for inverting hidden states back to prompts.
 
-This module implements the core SIP-It algorithm for inverting hidden states
+This module implements the SIP-It algorithm for inverting hidden states
 back to prompts. It supports inverting both baseline and steered activations.
-
-Key difference from original SIP-It:
-- We invert at the steering layer (not the last layer)
-- No need to replace layer norm with identity
 """
 
 import gc
 import torch
 from time import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, NamedTuple
 from torch import Tensor
+from time import strftime, gmtime
+from dataclasses import dataclass
+import numpy as np
 
-from model_utils import set_seed
+
+def set_seed(seed: int):
+    """Set random seed for reproducibility."""
+    import random
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def format_time_minutes(seconds: float) -> str:
+    return strftime("%M:%S", gmtime(seconds))
 
 
 def format_token(token: str, length: int = 15) -> str:
@@ -79,60 +96,68 @@ def extract_hidden_states_iterative(
     return torch.stack(target_embeddings)
 
 
-def compute_gradient_and_loss(
-    cont_embeddings: Tensor,
-    disc_tokens: Tensor,
-    model,
+class ExhaustiveOptimizer:
+    """Dummy optimizer for baseline exhaustive search."""
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def step(self, *args, **kwargs):
+        pass
+
+
+
+
+def compute_grad_and_elim(
+    embeddings: tuple[torch.Tensor, torch.Tensor],
+    model: torch.nn.Module,
     layer_idx: int,
-    h_target: Tensor,
-) -> Tuple[Tensor, float]:
-    """
-    Compute gradient for the last token embedding and discrete token loss.
-    
-    Args:
-        cont_embeddings: Continuous embeddings [1, seq_len, d_model]
-        disc_tokens: Discrete token IDs [1, seq_len]
-        model: The model
-        layer_idx: Target layer
-        h_target: Target hidden state [d_model]
-    
-    Returns:
-        Tuple of (gradient [d_model], loss value)
-    """
+    h_target: torch.Tensor,
+) -> tuple[torch.Tensor, float]:
+    # Move to device
     device = next(model.parameters()).device
-    
-    cont_embeddings = cont_embeddings.to(device)
-    disc_tokens = disc_tokens.to(device)
+
+
+    cont_embeddings = embeddings[0].to(device)
+    disc_tokens     = embeddings[1].to(device)
     h_target = h_target.to(device)
-    
-    # Prepare embeddings with grad only on last token
+
     fixed_embs = cont_embeddings.clone().detach()
     last_emb = fixed_embs[:, -1:, :].clone().requires_grad_(True)
-    
-    inputs_embeds = torch.cat([fixed_embs[:, :-1, :], last_emb], dim=1)
-    
-    # Forward with continuous embeddings
+
+    inputs_embeds_cont = torch.cat([fixed_embs[:, :-1, :], last_emb], dim=1)
     outputs = model(
-        inputs_embeds=inputs_embeds,
-        output_hidden_states=True,
+        inputs_embeds=inputs_embeds_cont,
+        output_hidden_states=True
     )
-    h_last_cont = outputs.hidden_states[layer_idx][0, -1, :]
-    
-    # Forward with discrete tokens (no grad)
+    hidden_states = outputs.hidden_states
+    h_last_cont = hidden_states[layer_idx][0, -1, :]
+
     with torch.no_grad():
-        outputs_disc = model(
+        outputs = model(
             input_ids=disc_tokens,
             output_hidden_states=True,
+            use_cache=False
         )
-    h_last_disc = outputs_disc.hidden_states[layer_idx][0, -1, :].detach()
-    
-    # Compute losses
+    hidden_states = outputs.hidden_states
+    h_last_disc = hidden_states[layer_idx][0, -1, :].detach()
+
+
+    # Compute MSE loss for last token
+    # loss_cont = torch.nn.functional.mse_loss(h_last_cont, h_target, reduction='sum')
     loss_cont = torch.nn.functional.mse_loss(h_last_cont, h_target, reduction='mean')
     loss_disc = torch.nn.functional.mse_loss(h_last_disc, h_target, reduction='sum')
     
     loss_cont.backward()
-    
-    return last_emb.grad.squeeze(0, 1), loss_disc.item()
+    return last_emb.grad.squeeze(0, 1), loss_disc
+
+@dataclass
+class TokenSearchResult:
+    """Result of searching for a single token."""
+    token_id: Optional[int]
+    embedding: Optional[Tensor]
+    timesteps: int
+    top_k_tokens: List[Tuple[int, float]]  # List of (token_id, distance) pairs
+    success: bool
 
 
 def find_token(
@@ -145,102 +170,173 @@ def find_token(
     layer_idx: int,
     h_target: Tensor,
     lr: float,
+    scheduler: bool = False,
     verbose: bool = True,
-) -> Tuple[Optional[int], Optional[Tensor], int]:
+    baseline: bool = False,
+    top_k: int = 10,
+) -> TokenSearchResult:
     """
-    Find the next token that minimizes the distance to target hidden state.
-    
-    Uses gradient-guided search over the embedding matrix.
+    Find a single token that best matches the target hidden state.
     
     Args:
-        token_idx: Current token position
-        embedding_matrix: Token embedding matrix [vocab_size, d_model]
-        discovered_embeddings: List of discovered token embeddings so far
-        discovered_ids: List of discovered token IDs so far
+        token_idx: Index of the token being searched for
+        embedding_matrix: The model's embedding matrix
+        discovered_embeddings: Embeddings of already discovered tokens
+        discovered_ids: IDs of already discovered tokens
         model: The model
         tokenizer: The tokenizer
-        layer_idx: Target layer
+        layer_idx: Layer to target
         h_target: Target hidden states [seq_len, d_model]
-        lr: Learning rate for gradient step
+        lr: Learning rate
+        scheduler: Whether to use learning rate scheduler
         verbose: Whether to print progress
+        baseline: Whether to use exhaustive baseline search
+        top_k: Number of top candidates to track
     
     Returns:
-        Tuple of (token_id, token_embedding, final_timestep)
+        TokenSearchResult containing the found token info and top-k candidates
     """
     device = next(model.parameters()).device
-    
     copy_embedding_matrix = embedding_matrix.clone().detach().requires_grad_(False)
-    
-    # Random initialization
+
+    reset_extra = embedding_matrix.size(0) // 25_000
+
+    if baseline:
+        perm = torch.randperm(copy_embedding_matrix.size(0))
+        copy_embedding_matrix = copy_embedding_matrix[perm]
+
     token_id = torch.randint(0, embedding_matrix.size(0), (1,)).item()
+    
     embedding = copy_embedding_matrix[token_id].clone().requires_grad_(True)
     temp_embedding = copy_embedding_matrix[token_id].clone().detach()
-    
-    optimizer = torch.optim.SGD([embedding], lr=lr)
-    
+
+    optimizer = torch.optim.SGD([embedding], lr=lr) if not baseline else ExhaustiveOptimizer()
+    if scheduler:
+        scheduler_obj = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', factor=0.99, threshold=lr / 100, patience=200
+        )
+
     initial_desc = f'Token [{token_idx + 1:2d}/{h_target.size(0):2d}]'
     final_timestep = embedding_matrix.size(0)
     start_time = time()
     
+    # Track top-k candidates: (token_id, loss)
+    top_k_candidates: List[Tuple[int, float]] = []
+    
     for i in range(embedding_matrix.size(0)):
-        # Build input embeddings
         input_embeddings = torch.stack(
             discovered_embeddings + [embedding]
-        ).unsqueeze(0)
-        input_ids = torch.tensor(
+        ).unsqueeze(0) 
+        input_embeddings_disc = torch.tensor(
             discovered_ids + [token_id]
-        ).unsqueeze(0)
+        ).unsqueeze(0) 
+
+        grad_oracle = loss = torch.zeros_like(h_target[token_idx])
+
+        if baseline:
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_embeddings_disc.to(device),
+                    output_hidden_states=True
+                )
+                hidden_states = outputs.hidden_states
+            
+            h_pred = hidden_states[layer_idx][0, -1, :].detach()
+            loss = torch.nn.functional.mse_loss(h_pred, h_target[token_idx], reduction='sum')
+        else:
+            grad_oracle, loss = compute_grad_and_elim(
+                (input_embeddings, input_embeddings_disc),
+                model=model,
+                layer_idx=layer_idx, 
+                h_target=h_target[token_idx]
+            )
+
+        # Check for NaN
+        if torch.isnan(loss) or (not baseline and torch.isnan(grad_oracle).any()):
+            return TokenSearchResult(
+                token_id=None,
+                embedding=None,
+                timesteps=i,
+                top_k_tokens=top_k_candidates,
+                success=False
+            )
+
+        loss_val = loss if isinstance(loss, float) else loss.item()
         
-        # Compute gradient and loss
-        grad_oracle, loss = compute_gradient_and_loss(
-            input_embeddings,
-            input_ids,
-            model,
-            layer_idx,
-            h_target[token_idx]
-        )
+        # Update top-k candidates
+        top_k_candidates.append((token_id, loss_val))
+        top_k_candidates.sort(key=lambda x: x[1])
+        top_k_candidates = top_k_candidates[:top_k]
+
+        grad_norm = grad_oracle.norm().item() if not baseline else 0.0
+        curr_token = tokenizer.decode([token_id])
         
-        if torch.isnan(torch.tensor(loss)) or torch.isnan(grad_oracle).any():
-            return None, None, 0
-        
-        grad_norm = grad_oracle.norm().item()
-        curr_token = tokenizer.decode([token_id], skip_special_tokens=True)
         emb_norm = embedding.norm().item()
-        
-        if verbose and (i + 1) % 100 == 0:
-            print(f"\r{initial_desc}[{i + 1:5d}/{embedding_matrix.size(0):5d}]: "
-                  f"Loss: {loss:.2e} - Grad: {grad_norm:.2e} - "
-                  f"Token: {format_token(curr_token):15s} - "
-                  f"Time: {time() - start_time:.1f}s", end="")
-        
-        # Check convergence
-        if loss < 1e-5 or grad_norm < 1e-12:
+        if verbose:
+            print(
+                '\r{}[{:5d}/{:5d}]: Loss: {:.2e} - Gradient norm: {:.2e} - Token: {:15s} - Emb Norm: {:.2e} - Time: {}'.format(
+                    initial_desc, 
+                    i + 1, 
+                    embedding_matrix.size(0),
+                    loss_val, 
+                    grad_norm, 
+                    format_token(curr_token, length=15), 
+                    emb_norm,
+                    format_time_minutes(time() - start_time)       
+                ),
+                end=''
+            )
+
+        if loss_val < 1e-5 or (not baseline and grad_norm < 1e-12):
             final_timestep = i + 1
             break
-        
-        # Normalize gradient if too large
-        if grad_norm > 1:
+
+        if not baseline and grad_norm > 1:
             grad_oracle = grad_oracle / grad_norm
-        
+
         embedding.grad = grad_oracle
-        optimizer.step()
-        
-        # Mark current token as visited
+
+        optimizer.step(lambda: loss)
+        if scheduler:
+            scheduler_obj.step(loss)
+
         copy_embedding_matrix[token_id] = float('inf')
-        
-        # Find nearest token
         distances = torch.norm(copy_embedding_matrix - embedding, dim=1)
         token_id = int(torch.argmin(distances))
         temp_embedding = copy_embedding_matrix[token_id].clone()
-        
-        # Periodically reset embedding to discrete value
-        if (i + 1) % 50 == 0:
+
+        if not baseline and (i + 1) % (50 * (1 + reset_extra * int(token_idx == 0))) == 0:
             embedding.data = temp_embedding.data
-    
+
+        if (i + 1) % 500 == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+
     if verbose:
-        print()  # Newline after progress
+        print()
+
+    correct_embedding = copy_embedding_matrix[token_id].clone().detach()
+    del copy_embedding_matrix, embedding, temp_embedding
     
-    return token_id, copy_embedding_matrix[token_id], final_timestep
+    return TokenSearchResult(
+        token_id=token_id,
+        embedding=correct_embedding,
+        timesteps=final_timestep,
+        top_k_tokens=top_k_candidates,
+        success=True
+    )
+
+
+@dataclass
+class InversionResult:
+    """Result of a prompt inversion."""
+    success: bool
+    total_time: Optional[float]
+    discovered_ids: Optional[List[int]]
+    timesteps: Optional[List[int]]
+    times: Optional[List[float]]
+    top_k_per_position: List[List[Tuple[int, float]]]  # Top-k tokens per position
+    failed_positions: List[int]  # Positions where inversion failed
 
 
 def find_prompt(
@@ -249,113 +345,204 @@ def find_prompt(
     layer_idx: int,
     h_target: Tensor,
     lr: float,
+    scheduler: bool = False,
     verbose: bool = True,
-) -> Tuple[Optional[float], Optional[List[int]], Optional[List[int]], Optional[List[float]]]:
+    baseline: bool = False,
+    special_start_tokens: Optional[List[int]] = None,
+    continue_on_failure: bool = False,
+    ground_truth_ids: Optional[List[int]] = None,
+    top_k: int = 10,
+) -> InversionResult:
     """
     Find a prompt that produces the target hidden states.
     
     Args:
         model: The model
         tokenizer: The tokenizer
-        layer_idx: Target layer
+        layer_idx: Layer to target
         h_target: Target hidden states [seq_len, d_model]
         lr: Learning rate
+        scheduler: Whether to use LR scheduler
         verbose: Whether to print progress
+        baseline: Whether to use exhaustive baseline search
+        special_start_tokens: Special tokens to prepend (e.g., [128000])
+        continue_on_failure: If True, continue with ground truth token when inversion fails
+        ground_truth_ids: Ground truth token IDs (required if continue_on_failure=True)
+        top_k: Number of top candidate tokens to track per position
     
     Returns:
-        Tuple of (total_time, token_ids, timesteps_per_token, time_per_token)
+        InversionResult containing discovered tokens and metadata
     """
     embedding_matrix = model.get_input_embeddings().weight
-    
+
     if h_target.dim() == 1:
         h_target = h_target.unsqueeze(0)
-    
+
     discovered_embeddings = []
     discovered_ids = []
     timesteps = []
     times = []
-    
+    top_k_per_position = []
+    failed_positions = []
+
+    if special_start_tokens is not None:
+        for token_id in special_start_tokens:
+            discovered_ids.append(token_id)
+            discovered_embeddings.append(
+                embedding_matrix[token_id]
+                .clone()
+                .detach()
+                .requires_grad_(False)
+            )
+
     start_time = time()
-    
     for i in range(h_target.size(0)):
         token_start_time = time()
-        
-        next_token_id, next_token_embedding, final_timestep = find_token(
-            i, embedding_matrix,
+
+        result = find_token(
+            i, embedding_matrix, 
             discovered_embeddings, discovered_ids,
             model, tokenizer, layer_idx, h_target,
-            lr, verbose
+            lr, scheduler, verbose, baseline,
+            top_k=top_k,
         )
-        
+
         token_end_time = time()
         
-        if next_token_embedding is None:
-            return None, None, None, None
-        
-        discovered_embeddings.append(next_token_embedding)
-        discovered_ids.append(next_token_id)
-        timesteps.append(final_timestep)
+        # Store top-k for this position regardless of success
+        top_k_per_position.append(result.top_k_tokens)
+
+        if not result.success or result.embedding is None:
+            failed_positions.append(i)
+            
+            if continue_on_failure and ground_truth_ids is not None:
+                # Use ground truth token for this position
+                gt_token_id = ground_truth_ids[i]
+                gt_embedding = embedding_matrix[gt_token_id].clone().detach().requires_grad_(False)
+                
+                discovered_embeddings.append(gt_embedding)
+                discovered_ids.append(gt_token_id)
+                timesteps.append(result.timesteps)
+                times.append(token_end_time - token_start_time)
+                
+                if verbose:
+                    print(f"  [Using ground truth token {gt_token_id} for position {i}]")
+                continue
+            else:
+                # Return with partial results
+                return InversionResult(
+                    success=False,
+                    total_time=time() - start_time,
+                    discovered_ids=discovered_ids,
+                    timesteps=timesteps,
+                    times=times,
+                    top_k_per_position=top_k_per_position,
+                    failed_positions=failed_positions,
+                )
+
+        discovered_embeddings.append(result.embedding)
+        discovered_ids.append(result.token_id)
+        timesteps.append(result.timesteps)
         times.append(token_end_time - token_start_time)
-        
+
         gc.collect()
         torch.cuda.empty_cache()
-    
+
     end_time = time()
-    
-    return end_time - start_time, discovered_ids, timesteps, times
+
+    return InversionResult(
+        success=len(failed_positions) == 0,
+        total_time=end_time - start_time,
+        discovered_ids=discovered_ids,
+        timesteps=timesteps,
+        times=times,
+        top_k_per_position=top_k_per_position,
+        failed_positions=failed_positions,
+    )
 
 
 def inversion_attack(
-    input_ids: Tensor,
-    model,
-    tokenizer,
+    input_ids: Tensor, 
+    model, 
+    tokenizer, 
     layer_idx: int,
-    lr: float = 1.0,
-    seed: int = 42,
+    lr: float,
+    seed: int = 8, 
+    scheduler: bool = False,
     verbose: bool = True,
-) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]]]:
+    baseline: bool = False,
+    special_start_tokens: Optional[List[int]] = None,
+    continue_on_failure: bool = False,
+    top_k: int = 10,
+) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]], InversionResult]:
     """
-    Perform standard inversion attack (no steering).
+    Perform inversion attack on input IDs.
     
     Args:
-        input_ids: Target token IDs [1, seq_len]
+        input_ids: Input token IDs [1, seq_len]
         model: The model
         tokenizer: The tokenizer
-        layer_idx: Layer to target for inversion
+        layer_idx: Layer to target
         lr: Learning rate
         seed: Random seed
+        scheduler: Whether to use LR scheduler
         verbose: Whether to print progress
+        baseline: Whether to use exhaustive baseline
+        special_start_tokens: Special tokens to prepend
+        continue_on_failure: If True, continue with ground truth when inversion fails
+        top_k: Number of top candidate tokens to track
     
     Returns:
-        Tuple of (success, time, reconstructed_ids, times)
+        Tuple of (match, time, discovered_ids, times, full_result)
     """
     set_seed(seed)
     
-    # Extract target hidden states
-    h_target = extract_hidden_states_iterative(input_ids, model, layer_idx)
-    
-    # Find prompt
-    inversion_time, discovered_ids, timesteps, times = find_prompt(
-        model, tokenizer, layer_idx, h_target, lr, verbose
+    new_input_ids = (
+        torch.cat(
+            [
+                torch.tensor(
+                    special_start_tokens, 
+                    dtype=torch.long, 
+                    device=input_ids.device
+                ).unsqueeze(0), 
+                input_ids
+            ],
+            dim=1
+        ) if special_start_tokens is not None else
+        input_ids
+    )
+
+
+    h_target = extract_hidden_states_iterative(new_input_ids, model, layer_idx)
+    start_from = new_input_ids.size(1) - input_ids.size(1)
+
+    # Extract ground truth IDs for continue_on_failure mode
+    ground_truth_ids = input_ids[0].tolist() if continue_on_failure else None
+
+    result = find_prompt(
+        model, tokenizer, layer_idx, h_target[start_from:], 
+        lr, scheduler, verbose, baseline, special_start_tokens,
+        continue_on_failure=continue_on_failure,
+        ground_truth_ids=ground_truth_ids,
+        top_k=top_k,
     )
     
-    if discovered_ids is None:
+    if result.discovered_ids is None:
         if verbose:
-            print("Inversion failed or diverged.")
-        return False, None, None, None
-    
-    # Check if we found exact match
-    match = all([x == y for x, y in zip(input_ids[0].tolist(), discovered_ids)])
+            print('Inversion failed or diverged with the given parameters.')
+        return False, None, None, None, result
+
+    match = all([x == y for x, y in zip(input_ids[0].tolist(), result.discovered_ids[start_from:])])
     
     if verbose:
-        original = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        reconstructed = tokenizer.decode(discovered_ids, skip_special_tokens=True)
-        print(f"Original:      {original[:100]}...")
-        print(f"Reconstructed: {reconstructed[:100]}...")
-        print(f"Match: {match}")
-        print(f"Time: {inversion_time:.2f}s")
-    
-    return match, inversion_time, discovered_ids, times
+        print(f'Original {"==" if match else "!="} Reconstructed')
+        print(f'Inversion time: {result.total_time:.2f} seconds')
+        if result.timesteps:
+            print(f'Average Timesteps: {np.mean(result.timesteps):.2f}')
+        if result.failed_positions:
+            print(f'Failed positions: {result.failed_positions}')
+
+    return match, result.total_time, result.discovered_ids, result.times, result
 
 
 def inversion_attack_with_target(
@@ -367,7 +554,10 @@ def inversion_attack_with_target(
     seed: int = 42,
     verbose: bool = True,
     original_ids: Optional[Tensor] = None,
-) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]]]:
+    special_start_tokens: Optional[List[int]] = None,
+    continue_on_failure: bool = False,
+    top_k: int = 10,
+) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]], InversionResult]:
     """
     Perform inversion attack with custom target hidden states.
     
@@ -382,37 +572,50 @@ def inversion_attack_with_target(
         seed: Random seed
         verbose: Whether to print progress
         original_ids: Optional original token IDs for comparison
+        special_start_tokens: Special tokens to prepend
+        continue_on_failure: If True, continue with ground truth when inversion fails
+        top_k: Number of top candidate tokens to track
     
     Returns:
-        Tuple of (match_original, time, discovered_ids, times)
+        Tuple of (match_original, time, discovered_ids, times, full_result)
     """
     set_seed(seed)
     
+    # Extract ground truth IDs for continue_on_failure mode
+    ground_truth_ids = original_ids[0].tolist() if continue_on_failure and original_ids is not None else None
+    
     # Find prompt
-    inversion_time, discovered_ids, timesteps, times = find_prompt(
-        model, tokenizer, layer_idx, h_target, lr, verbose
+    result = find_prompt(
+        model, tokenizer, layer_idx, h_target, lr,
+        verbose=verbose,
+        special_start_tokens=special_start_tokens,
+        continue_on_failure=continue_on_failure,
+        ground_truth_ids=ground_truth_ids,
+        top_k=top_k,
     )
     
-    if discovered_ids is None:
+    if result.discovered_ids is None:
         if verbose:
             print("Inversion failed or diverged.")
-        return False, None, None, None
+        return False, None, None, None, result
     
     # Check if we match original (if provided)
     match = False
     if original_ids is not None:
-        match = all([x == y for x, y in zip(original_ids[0].tolist(), discovered_ids)])
+        match = all([x == y for x, y in zip(original_ids[0].tolist(), result.discovered_ids)])
     
     if verbose:
-        reconstructed = tokenizer.decode(discovered_ids, skip_special_tokens=True)
+        reconstructed = tokenizer.decode(result.discovered_ids, skip_special_tokens=True)
         print(f"Reconstructed: {reconstructed[:100]}...")
         if original_ids is not None:
-            original = tokenizer.decode(original_ids[0], skip_special_tokens=True)
+            original = tokenizer.decode(original_ids[0].tolist(), skip_special_tokens=True)
             print(f"Original:      {original[:100]}...")
             print(f"Match: {match}")
-        print(f"Time: {inversion_time:.2f}s")
+        print(f"Time: {result.total_time:.2f}s")
+        if result.failed_positions:
+            print(f"Failed positions: {result.failed_positions}")
     
-    return match, inversion_time, discovered_ids, times
+    return match, result.total_time, result.discovered_ids, result.times, result
 
 
 def compute_activation_mse(
@@ -440,3 +643,37 @@ def compute_activation_mse(
     mse = torch.nn.functional.mse_loss(actual_acts, target_activations).item()
     
     return mse
+
+
+def print_top_k_tokens(
+    result: InversionResult,
+    tokenizer,
+    original_ids: Optional[List[int]] = None,
+) -> None:
+    """
+    Print the top-k tokens found at each position during inversion.
+    
+    Args:
+        result: The inversion result
+        tokenizer: The tokenizer
+        original_ids: Optional original token IDs for comparison
+    """
+    print("\n" + "="*60)
+    print("TOP-K TOKENS PER POSITION")
+    print("="*60)
+    
+    for pos, top_k in enumerate(result.top_k_per_position):
+        gt_marker = ""
+        if original_ids is not None and pos < len(original_ids):
+            gt_id = original_ids[pos]
+            gt_token = tokenizer.decode([gt_id])
+            gt_marker = f" (GT: {format_token(gt_token)})"
+        
+        failed_marker = " [FAILED]" if pos in result.failed_positions else ""
+        print(f"\nPosition {pos}{gt_marker}{failed_marker}:")
+        
+        for rank, (token_id, loss) in enumerate(top_k):
+            token_str = tokenizer.decode([token_id])
+            is_gt = original_ids is not None and pos < len(original_ids) and token_id == original_ids[pos]
+            gt_flag = " <-- GT" if is_gt else ""
+            print(f"  {rank+1:2d}. [{token_id:6d}] {format_token(token_str, 20):20s} loss={loss:.4e}{gt_flag}")
