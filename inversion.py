@@ -305,7 +305,8 @@ def find_token(
         token_id = int(torch.argmin(distances))
         temp_embedding = copy_embedding_matrix[token_id].clone()
 
-        if not baseline and (i + 1) % (50 * (1 + reset_extra * int(token_idx == 0))) == 0:
+        # if not baseline and (i + 1) % (50 * (1 + reset_extra * int(token_idx == 0))) == 0:
+        if not baseline and (i + 1) % 50 == 0:
             embedding.data = temp_embedding.data
 
         if (i + 1) % 500 == 0:
@@ -497,24 +498,25 @@ def inversion_attack(
     """
     set_seed(seed)
     
-    new_input_ids = (
-        torch.cat(
-            [
-                torch.tensor(
-                    special_start_tokens, 
-                    dtype=torch.long, 
-                    device=input_ids.device
-                ).unsqueeze(0), 
-                input_ids
-            ],
-            dim=1
-        ) if special_start_tokens is not None else
-        input_ids
-    )
+    # new_input_ids = (
+    #     torch.cat(
+    #         [
+    #             torch.tensor(
+    #                 special_start_tokens, 
+    #                 dtype=torch.long, 
+    #                 device=input_ids.device
+    #             ).unsqueeze(0), 
+    #             input_ids
+    #         ],
+    #         dim=1
+    #     ) if special_start_tokens is not None else
+    #     input_ids
+    # )
 
-
-    h_target = extract_hidden_states_iterative(new_input_ids, model, layer_idx)
-    start_from = new_input_ids.size(1) - input_ids.size(1)
+    # h_target = extract_hidden_states_iterative(new_input_ids, model, layer_idx)
+    # start_from = new_input_ids.size(1) - input_ids.size(1)
+    h_target = extract_hidden_states_iterative(input_ids, model, layer_idx)
+    start_from = 0
 
     # Extract ground truth IDs for continue_on_failure mode
     ground_truth_ids = input_ids[0].tolist() if continue_on_failure else None

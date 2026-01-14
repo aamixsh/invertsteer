@@ -16,6 +16,7 @@ class Config:
     
     # Model configuration
     model_id: str = "meta-llama/Llama-3.1-8B-Instruct"
+    # model_id: str = "meta-llama/Llama-3.2-1B-Instruct"
     device: str = "cuda"
     dtype: str = "float32"  # Use float32 for gradient computation in SIP-It
     

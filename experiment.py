@@ -84,10 +84,6 @@ def run_single_experiment(
     input_ids = inputs.input_ids.to(model.device)
     attention_mask = inputs.attention_mask.to(model.device)
 
-    if special_start_tokens is not None:
-        input_ids = input_ids[:, len(special_start_tokens):]
-        attention_mask = attention_mask[:, len(special_start_tokens):]
-    
     seq_len = input_ids.size(1)
     result["seq_len"] = seq_len
     result["original_ids"] = input_ids[0].tolist()
@@ -131,44 +127,46 @@ def run_single_experiment(
     print(f"Activation difference (L2): {act_diff:.4f}")
     print(f"Per-token difference: {act_diff_per_token:.4f}")
     
-    # Step 3: Baseline inversion
-    print("\n[Step 3] Inverting baseline activations...")
+    # # Step 3: Baseline inversion
+    # print("\n[Step 3] Inverting baseline activations...")
     
-    baseline_match, baseline_time, baseline_recon_ids, baseline_times, baseline_inv_result = inversion_attack(
-        input_ids, model, tokenizer, inversion_layer, lr, seed,
-        special_start_tokens=special_start_tokens,
-        continue_on_failure=continue_on_failure,
-        top_k=top_k,
-    )
+    # baseline_match, baseline_time, baseline_recon_ids, baseline_times, baseline_inv_result = inversion_attack(
+    #     input_ids, model, tokenizer, inversion_layer, lr, seed,
+    #     special_start_tokens=special_start_tokens,
+    #     continue_on_failure=continue_on_failure,
+    #     top_k=top_k,
+    # )
     
-    result["baseline_inversion"] = {
-        "match": baseline_match,
-        "time": baseline_time,
-        "reconstructed_ids": baseline_recon_ids,
-        "failed_positions": baseline_inv_result.failed_positions if baseline_inv_result else [],
-    }
+    # result["baseline_inversion"] = {
+    #     "match": baseline_match,
+    #     "time": baseline_time,
+    #     "reconstructed_ids": baseline_recon_ids,
+    #     "failed_positions": baseline_inv_result.failed_positions if baseline_inv_result else [],
+    # }
     
-    # Store top-k tokens for analysis
-    if baseline_inv_result and baseline_inv_result.top_k_per_position:
-        result["baseline_inversion"]["top_k_per_position"] = [
-            [(tid, dist) for tid, dist in pos_top_k]
-            for pos_top_k in baseline_inv_result.top_k_per_position
-        ]
+    # # Store top-k tokens for analysis
+    # if baseline_inv_result and baseline_inv_result.top_k_per_position:
+    #     result["baseline_inversion"]["top_k_per_position"] = [
+    #         [(tid, dist) for tid, dist in pos_top_k]
+    #         for pos_top_k in baseline_inv_result.top_k_per_position
+    #     ]
     
-    if baseline_recon_ids:
-        baseline_recon_text = tokenizer.decode(baseline_recon_ids, skip_special_tokens=True)
-        result["baseline_inversion"]["reconstructed_text"] = baseline_recon_text
+    # if baseline_recon_ids:
+    #     baseline_recon_text = tokenizer.decode(baseline_recon_ids)
+    #     result["baseline_inversion"]["reconstructed_text"] = baseline_recon_text
         
-        recon_ids_tensor = torch.tensor(baseline_recon_ids).unsqueeze(0).to(model.device)
-        baseline_mse = compute_activation_mse(
-            model, recon_ids_tensor, baseline_acts, inversion_layer
-        )
-        result["baseline_inversion"]["mse"] = baseline_mse
+    #     recon_ids_tensor = torch.tensor(baseline_recon_ids).unsqueeze(0).to(model.device)
+    #     baseline_mse = compute_activation_mse(
+    #         model, recon_ids_tensor, baseline_acts, inversion_layer
+    #     )
+    #     result["baseline_inversion"]["mse"] = baseline_mse
+
+    # print("Baseline inversion result: ", baseline_inv_result)
     
-    # Print top-k if failed
-    if baseline_inv_result and baseline_inv_result.failed_positions:
-        print("\n[Baseline] Failed positions - showing top-k candidates:")
-        print_top_k_tokens(baseline_inv_result, tokenizer, result["original_ids"])
+    # # Print top-k if failed
+    # if baseline_inv_result and baseline_inv_result.failed_positions:
+    #     print("\n[Baseline] Failed positions - showing top-k candidates:")
+    #     print_top_k_tokens(baseline_inv_result, tokenizer, result["original_ids"])
     
     # Step 4: Steered inversion
     print("\n[Step 4] Inverting steered activations...")
@@ -196,7 +194,7 @@ def run_single_experiment(
         ]
     
     if steered_recon_ids:
-        steered_recon_text = tokenizer.decode(steered_recon_ids, skip_special_tokens=True)
+        steered_recon_text = tokenizer.decode(steered_recon_ids)
         result["steered_inversion"]["reconstructed_text"] = steered_recon_text
         
         recon_ids_tensor = torch.tensor(steered_recon_ids).unsqueeze(0).to(model.device)
@@ -231,7 +229,7 @@ def run_single_experiment(
                 generation_config=gen_config,
             )
         recon_gen_tokens = recon_outputs[0, recon_input_ids.size(1):]
-        recon_generation = tokenizer.decode(recon_gen_tokens, skip_special_tokens=True)
+        recon_generation = tokenizer.decode(recon_gen_tokens)
         
         result["reconstructed_prompt_generation"] = recon_generation
         print(f"Reconstructed prompt generation: {recon_generation[:100]}...")
@@ -260,7 +258,7 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
     n_layers = get_num_layers(model)
     print(f"Model has {n_layers} layers")
     print(f"Use chat template: {config.use_chat_template}")
-    print(f"Special start tokens: {config.special_start_tokens}")
+    # print(f"Special start tokens: {config.special_start_tokens}")
     
     # Step 1: Load steering direction
     print("\n" + "="*60)
@@ -403,7 +401,7 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, default="actadd", help="Steering method: actadd or ablation")
     parser.add_argument("--coeff", type=float, default=-1.0, help="Steering coefficient")
     parser.add_argument("--no-chat-template", action="store_true", 
-                        help="Do not use chat template (only BOS token for Llama)")
+                        help="Do not use chat template")
     parser.add_argument("--continue-on-failure", action="store_true",
                         help="Continue with ground truth when inversion fails")
     parser.add_argument("--top-k", type=int, default=10, help="Number of top candidates to track")

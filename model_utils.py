@@ -12,17 +12,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # Llama 3 special tokens
-LLAMA3_BOS_TOKEN = 128000  # <|begin_of_text|>
-LLAMA3_CHAT_TOKENS = [128006, 882, 128007, 271]  # <|start_header_id|>user<|end_header_id|>\n\n
+LLAMA3_CHAT_TOKENS = [128000, 128006, 882, 128007, 271]  # <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n
 
 # Llama 3 chat template
-LLAMA3_CHAT_TEMPLATE = """<|start_header_id|>user<|end_header_id|>
+LLAMA3_CHAT_TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header_id|>
 
 {instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
 
-LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM = """<|start_header_id|>system<|end_header_id|>
+LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 {system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
 
@@ -130,7 +129,7 @@ def tokenize_instructions(
         padding=True,
         truncation=False,
         return_tensors="pt",
-        add_special_tokens=not use_chat_template,  # Add BOS when not using chat template
+        add_special_tokens=False,
     )
 
     return result
@@ -166,18 +165,18 @@ def get_special_start_tokens(
     Returns:
         List of special token IDs, or None for models without special tokens
     """
-    # Llama 3 models
-    if 'llama' in model_id.lower() or 'Llama' in model_id:
-        if use_chat_template:
-            return [LLAMA3_BOS_TOKEN] + LLAMA3_CHAT_TOKENS
-        else:
-            return [LLAMA3_BOS_TOKEN]
+    # # Llama 3 models
+    # if 'llama' in model_id.lower():
+    #     if use_chat_template:
+    #         return LLAMA3_CHAT_TOKENS
+    #     else:
+    #         return None
     
-    # GPT-2 and similar models don't need special start tokens
-    if 'gpt2' in model_id.lower():
-        return None
+    # # GPT-2 and similar models don't need special start tokens
+    # if 'gpt2' in model_id.lower():
+    #     return None
     
-    # Default: no special tokens
+    # Default: no special tokens for now.
     return None
 
 
