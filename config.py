@@ -15,13 +15,15 @@ class Config:
     """Configuration for invertsteer experiments."""
     
     # Model configuration
-    model_id: str = "meta-llama/Llama-3.1-8B-Instruct"
-    # model_id: str = "meta-llama/Llama-3.2-1B-Instruct"
+    # model_id: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model_id: str = "meta-llama/Llama-3.2-1B-Instruct"
+    # model_id: str = "openai-community/gpt2"
     device: str = "cuda"
     dtype: str = "float32"  # Use float32 for gradient computation in SIP-It
     
     # Template configuration
-    use_chat_template: bool = True  # If False, only use BOS token for Llama
+    use_chat_template: bool = True  # If False, use no chat template
+    add_special_tokens: bool = False  # If True, add special tokens (like BOS token for Llama)
     
     # Special tokens (auto-populated based on model and template settings)
     special_start_tokens: Optional[List[int]] = None

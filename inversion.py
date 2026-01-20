@@ -108,7 +108,8 @@ class ExhaustiveOptimizer:
 
 
 def compute_grad_and_elim(
-    embeddings: tuple[torch.Tensor, torch.Tensor],
+    input_embeddings: torch.Tensor,
+    input_ids: torch.Tensor,
     model: torch.nn.Module,
     layer_idx: int,
     h_target: torch.Tensor,
@@ -117,8 +118,8 @@ def compute_grad_and_elim(
     device = next(model.parameters()).device
 
 
-    cont_embeddings = embeddings[0].to(device)
-    disc_tokens     = embeddings[1].to(device)
+    cont_embeddings = input_embeddings.to(device)
+    disc_tokens     = input_ids.to(device)
     h_target = h_target.to(device)
 
     fixed_embs = cont_embeddings.clone().detach()
@@ -146,9 +147,10 @@ def compute_grad_and_elim(
     # loss_cont = torch.nn.functional.mse_loss(h_last_cont, h_target, reduction='sum')
     loss_cont = torch.nn.functional.mse_loss(h_last_cont, h_target, reduction='mean')
     loss_disc = torch.nn.functional.mse_loss(h_last_disc, h_target, reduction='sum')
+    distance = torch.norm(h_last_disc - h_target).item()
     
     loss_cont.backward()
-    return last_emb.grad.squeeze(0, 1), loss_disc
+    return last_emb.grad.squeeze(0, 1), loss_disc, distance
 
 @dataclass
 class TokenSearchResult:
@@ -220,9 +222,11 @@ def find_token(
     final_timestep = embedding_matrix.size(0)
     start_time = time()
     
-    # Track top-k candidates: (token_id, loss)
-    top_k_candidates: List[Tuple[int, float]] = []
-    
+    # Track all candidates: (token_id, distance)
+    all_candidates: set = set()
+
+    success = False
+
     for i in range(embedding_matrix.size(0)):
         input_embeddings = torch.stack(
             discovered_embeddings + [embedding]
@@ -244,8 +248,8 @@ def find_token(
             h_pred = hidden_states[layer_idx][0, -1, :].detach()
             loss = torch.nn.functional.mse_loss(h_pred, h_target[token_idx], reduction='sum')
         else:
-            grad_oracle, loss = compute_grad_and_elim(
-                (input_embeddings, input_embeddings_disc),
+            grad_oracle, loss, distance = compute_grad_and_elim(
+                input_embeddings, input_embeddings_disc,
                 model=model,
                 layer_idx=layer_idx, 
                 h_target=h_target[token_idx]
@@ -253,20 +257,20 @@ def find_token(
 
         # Check for NaN
         if torch.isnan(loss) or (not baseline and torch.isnan(grad_oracle).any()):
+            # Select top-k tokens at failure point
+            final_top_k_candidates = sorted(all_candidates, key=lambda x: x[1])[:top_k]
             return TokenSearchResult(
                 token_id=None,
                 embedding=None,
                 timesteps=i,
-                top_k_tokens=top_k_candidates,
+                top_k_tokens=final_top_k_candidates,
                 success=False
             )
 
+        # Add all tokens as candidate
+        all_candidates.add((token_id, distance))
+
         loss_val = loss if isinstance(loss, float) else loss.item()
-        
-        # Update top-k candidates
-        top_k_candidates.append((token_id, loss_val))
-        top_k_candidates.sort(key=lambda x: x[1])
-        top_k_candidates = top_k_candidates[:top_k]
 
         grad_norm = grad_oracle.norm().item() if not baseline else 0.0
         curr_token = tokenizer.decode([token_id])
@@ -289,6 +293,7 @@ def find_token(
 
         if loss_val < 1e-5 or (not baseline and grad_norm < 1e-12):
             final_timestep = i + 1
+            success = True
             break
 
         if not baseline and grad_norm > 1:
@@ -318,13 +323,16 @@ def find_token(
 
     correct_embedding = copy_embedding_matrix[token_id].clone().detach()
     del copy_embedding_matrix, embedding, temp_embedding
+
+    # Select top-k tokens from all candidates by smallest distance
+    final_top_k_candidates = sorted(all_candidates, key=lambda x: x[1])[:top_k]
     
     return TokenSearchResult(
         token_id=token_id,
         embedding=correct_embedding,
         timesteps=final_timestep,
-        top_k_tokens=top_k_candidates,
-        success=True
+        top_k_tokens=final_top_k_candidates,
+        success=success
     )
 
 
@@ -416,18 +424,30 @@ def find_prompt(
         if not result.success or result.embedding is None:
             failed_positions.append(i)
             
-            if continue_on_failure and ground_truth_ids is not None:
-                # Use ground truth token for this position
-                gt_token_id = ground_truth_ids[i]
-                gt_embedding = embedding_matrix[gt_token_id].clone().detach().requires_grad_(False)
+            if continue_on_failure:
+                # Use the top closest token found for this position (if any), else fallback to failure
+                if result.top_k_tokens and len(result.top_k_tokens) > 0:
+                    top_token_id = result.top_k_tokens[0][0]
+                else:
+                    # Fallback: cannot find any candidate, return with partial results
+                    return InversionResult(
+                        success=False,
+                        total_time=time() - start_time,
+                        discovered_ids=discovered_ids,
+                        timesteps=timesteps,
+                        times=times,
+                        top_k_per_position=top_k_per_position,
+                        failed_positions=failed_positions,
+                    )
+                top_embedding = embedding_matrix[top_token_id].clone().detach().requires_grad_(False)
                 
-                discovered_embeddings.append(gt_embedding)
-                discovered_ids.append(gt_token_id)
+                discovered_embeddings.append(top_embedding)
+                discovered_ids.append(top_token_id)
                 timesteps.append(result.timesteps)
                 times.append(token_end_time - token_start_time)
-                
+
                 if verbose:
-                    print(f"  [Using ground truth token {gt_token_id} for position {i}]")
+                    print(f"  [Using top closest token {top_token_id} for position {i}]")
                 continue
             else:
                 # Return with partial results
@@ -452,7 +472,7 @@ def find_prompt(
     end_time = time()
 
     return InversionResult(
-        success=len(failed_positions) == 0,
+        success=True,
         total_time=end_time - start_time,
         discovered_ids=discovered_ids,
         timesteps=timesteps,
@@ -497,44 +517,26 @@ def inversion_attack(
         Tuple of (match, time, discovered_ids, times, full_result)
     """
     set_seed(seed)
-    
-    # new_input_ids = (
-    #     torch.cat(
-    #         [
-    #             torch.tensor(
-    #                 special_start_tokens, 
-    #                 dtype=torch.long, 
-    #                 device=input_ids.device
-    #             ).unsqueeze(0), 
-    #             input_ids
-    #         ],
-    #         dim=1
-    #     ) if special_start_tokens is not None else
-    #     input_ids
-    # )
 
-    # h_target = extract_hidden_states_iterative(new_input_ids, model, layer_idx)
-    # start_from = new_input_ids.size(1) - input_ids.size(1)
     h_target = extract_hidden_states_iterative(input_ids, model, layer_idx)
-    start_from = 0
 
     # Extract ground truth IDs for continue_on_failure mode
     ground_truth_ids = input_ids[0].tolist() if continue_on_failure else None
 
     result = find_prompt(
-        model, tokenizer, layer_idx, h_target[start_from:], 
+        model, tokenizer, layer_idx, h_target, 
         lr, scheduler, verbose, baseline, special_start_tokens,
         continue_on_failure=continue_on_failure,
         ground_truth_ids=ground_truth_ids,
         top_k=top_k,
     )
     
-    if result.discovered_ids is None:
+    if not result.success or result.discovered_ids is None:
         if verbose:
             print('Inversion failed or diverged with the given parameters.')
         return False, None, None, None, result
 
-    match = all([x == y for x, y in zip(input_ids[0].tolist(), result.discovered_ids[start_from:])])
+    match = all([x == y for x, y in zip(input_ids[0].tolist(), result.discovered_ids)])
     
     if verbose:
         print(f'Original {"==" if match else "!="} Reconstructed')
@@ -583,7 +585,7 @@ def inversion_attack_with_target(
     """
     set_seed(seed)
     
-    # Extract ground truth IDs for continue_on_failure mode
+    # Extract ground truth IDs
     ground_truth_ids = original_ids[0].tolist() if continue_on_failure and original_ids is not None else None
     
     # Find prompt
@@ -596,7 +598,7 @@ def inversion_attack_with_target(
         top_k=top_k,
     )
     
-    if result.discovered_ids is None:
+    if not result.success or result.discovered_ids is None:
         if verbose:
             print("Inversion failed or diverged.")
         return False, None, None, None, result

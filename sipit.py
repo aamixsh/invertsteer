@@ -17,6 +17,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 import argparse
 import torch
 from typing import Any, Optional, List
+import torch.nn as nn
 
 import transformers
 transformers.logging.set_verbosity_error()
@@ -30,6 +31,51 @@ from inversion import (
     InversionResult,
 )
 
+from model_utils import get_tokenize_fn
+
+def replace_last_norm(model_id: str, model: AutoModelForCausalLM):
+    attr_name = {
+        'roneneldan/TinyStories-1M': 'transformer.ln_f',
+        'roneneldan/TinyStories-8M': 'transformer.ln_f',
+        'roneneldan/TinyStories-33M': 'transformer.ln_f',
+        
+        'openai-community/gpt2': 'transformer.ln_f',
+        'openai-community/gpt2-medium': 'transformer.ln_f',
+        'openai-community/gpt2-large': 'transformer.ln_f',
+
+        'google/gemma-3-1b-pt': 'model.norm',
+        'google/gemma-3-4b-pt': 'model.norm',
+        'google/gemma-3-12b-pt': 'model.norm',
+        
+        'microsoft/Phi-4-mini-instruct': 'model.norm',
+        'mistralai/Mistral-7B-v0.1': 'model.norm',
+
+        'Qwen/Qwen2.5-0.5B': 'model.norm',
+        'meta-llama/Llama-3.2-1B': 'model.norm',
+        'meta-llama/Llama-3.2-1B-Instruct': 'model.norm',
+        'meta-llama/Llama-3.2-3B': 'model.norm',
+        'meta-llama/Llama-3.2-3B-Instruct': 'model.norm',
+        'meta-llama/Llama-3.1-8B': 'model.norm',
+        'meta-llama/Llama-3.1-8B-Instruct': 'model.norm',
+    }
+
+    if model_id not in attr_name:
+        raise NotImplementedError(f'Model ID `{model_id}` is not supported!')
+    
+    parts = attr_name[model_id].split('.')
+    parent_path, leaf = '.'.join(parts[:-1]), parts[-1]
+
+    parent = _get_attr_by_path(model, parent_path) if parent_path else model
+    model.norm_bk = getattr(parent, leaf)
+    setattr(parent, leaf, nn.Identity())
+
+
+def _get_attr_by_path(root, path: str):
+    """Get attribute by a dotted path, or raise AttributeError."""
+    obj = root
+    for part in path.split('.'):
+        obj = getattr(obj, part)
+    return obj
 
 # Model layer counts for supported models
 MODEL_LAYERS = {
@@ -143,6 +189,7 @@ def run_inversion(
     scheduler: bool = False,
     baseline: bool = False,
     use_chat_template: bool = True,
+    add_special_tokens: bool = False,
     continue_on_failure: bool = False,
     top_k: int = 10,
     verbose: bool = True,
@@ -161,6 +208,7 @@ def run_inversion(
         baseline: Whether to use exhaustive baseline
         use_chat_template: If True, use full chat template tokens.
                           If False, only use BOS token.
+        add_special_tokens: If True, add special tokens (like BOS token for Llama)
         continue_on_failure: If True, continue with ground truth when inversion fails
         top_k: Number of top candidate tokens to track
         verbose: Whether to print progress
@@ -173,14 +221,17 @@ def run_inversion(
     # Load model
     dtype = torch.float32
     model, tokenizer = load_model(model_id, device, dtype)
+
+    replace_last_norm(model_id, model)
     
     # Get layer count and adjust layer index
     total_layers = get_num_layers(model_id)
     if layer < 0:
         layer = total_layers + layer + 1
     
-    # Get special start tokens
-    special_start_tokens = get_special_start_tokens(model_id, use_chat_template)
+    # # Get special start tokens
+    # special_start_tokens = get_special_start_tokens(model_id, use_chat_template)
+    special_start_tokens = None
     
     if verbose:
         print(f'Prompt: {prompt}')
@@ -190,21 +241,16 @@ def run_inversion(
             print(f'Special start tokens: {special_start_tokens}')
     
     # Tokenize prompt (without special tokens, we add them separately)
-    enc = tokenizer(
-        prompt,
-        add_special_tokens=False,
-        return_attention_mask=False,
-    )
-    input_ids_list: List[int] = enc['input_ids']
+    tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=use_chat_template, add_special_tokens=add_special_tokens)
+    inputs = tokenize_fn(instructions=[prompt])
+    input_ids = inputs.input_ids.to(model.device)
     
     if verbose:
-        print(f'Input IDs ({len(input_ids_list)} tokens): {input_ids_list}')
-        for i, token_id in enumerate(input_ids_list):
+        print(f'Input IDs ({len(input_ids[0])} tokens): {input_ids}')
+        for i, token_id in enumerate(input_ids[0]):
             print(f'  {i}: [{token_id:6d}] "{tokenizer.decode([token_id])}"')
     
     # Run inversion
-    input_ids = torch.tensor(input_ids_list, dtype=torch.long, device=device).unsqueeze(0)
-    
     match, time_taken, discovered_ids, times, result = inversion_attack(
         input_ids, 
         model, 
@@ -249,7 +295,7 @@ Examples:
     
     parser.add_argument('--prompt', type=str, default="Hey Aayush, I am Giorgos and I am sending you the hidden states of this super secret message: `jw!@@L901~~!==`! It should be encrypted enough :-)", 
                         help='Prompt to invert')
-    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.1-8B-Instruct',
+    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-1B',
                         help='Model ID')
     parser.add_argument('--device', type=str, default='cuda:1',
                         help='Device (cuda, cuda:0, cpu)')
@@ -267,6 +313,8 @@ Examples:
                         help='Do not use chat template (only BOS token for Llama)')
     parser.add_argument('--continue-on-failure', action='store_true',
                         help='Continue with ground truth when inversion fails')
+    parser.add_argument('--add-special-tokens', action='store_true',
+                        help='Add special tokens (like BOS token for Llama)')
     parser.add_argument('--top-k', type=int, default=10,
                         help='Number of top candidate tokens to track')
     parser.add_argument('--quiet', action='store_true',
@@ -284,6 +332,7 @@ Examples:
         scheduler=args.scheduler,
         baseline=args.baseline,
         use_chat_template=not args.no_chat_template,
+        add_special_tokens=args.add_special_tokens,
         continue_on_failure=args.continue_on_failure,
         top_k=args.top_k,
         verbose=not args.quiet,

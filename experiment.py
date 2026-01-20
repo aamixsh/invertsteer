@@ -161,11 +161,8 @@ def run_single_experiment(
     #     )
     #     result["baseline_inversion"]["mse"] = baseline_mse
 
-    # print("Baseline inversion result: ", baseline_inv_result)
-    
-    # # Print top-k if failed
-    # if baseline_inv_result and baseline_inv_result.failed_positions:
-    #     print("\n[Baseline] Failed positions - showing top-k candidates:")
+    # # Print top-k
+    # if baseline_inv_result:
     #     print_top_k_tokens(baseline_inv_result, tokenizer, result["original_ids"])
     
     # Step 4: Steered inversion
@@ -234,9 +231,8 @@ def run_single_experiment(
         result["reconstructed_prompt_generation"] = recon_generation
         print(f"Reconstructed prompt generation: {recon_generation[:100]}...")
     
-    # Print top-k if failed
-    if steered_inv_result and steered_inv_result.failed_positions:
-        print("\n[Steered] Failed positions - showing top-k candidates:")
+    # Print top-k
+    if steered_inv_result:
         print_top_k_tokens(steered_inv_result, tokenizer, result["original_ids"])
     
     return result
@@ -253,7 +249,7 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
     # Load model
     print(f"\nLoading model: {config.model_id}")
     model, tokenizer = load_model(config.model_id, config.device, config.dtype)
-    tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template)
+    tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
     
     n_layers = get_num_layers(model)
     print(f"Model has {n_layers} layers")
@@ -353,7 +349,7 @@ def demo(config: Config):
     
     print(f"\nLoading model: {config.model_id}")
     model, tokenizer = load_model(config.model_id, config.device, config.dtype)
-    tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template)
+    tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
     
     direction_path = config.get_direction_path()
     if not os.path.exists(direction_path):
@@ -405,6 +401,8 @@ if __name__ == "__main__":
     parser.add_argument("--continue-on-failure", action="store_true",
                         help="Continue with ground truth when inversion fails")
     parser.add_argument("--top-k", type=int, default=10, help="Number of top candidates to track")
+    parser.add_argument("--add-special-tokens", action="store_true",
+                        help="Add special tokens (like BOS token for Llama)")
     args = parser.parse_args()
     
     config = Config()
@@ -418,6 +416,7 @@ if __name__ == "__main__":
     config.steering_method = args.method
     config.steering_coeff = args.coeff
     config.use_chat_template = not args.no_chat_template
+    config.add_special_tokens = args.add_special_tokens
     config.continue_on_failure = args.continue_on_failure
     config.top_k = args.top_k
     

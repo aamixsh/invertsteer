@@ -87,6 +87,7 @@ def tokenize_instructions(
     system: Optional[str] = None,
     include_trailing_whitespace: bool = True,
     use_chat_template: bool = True,
+    add_special_tokens: bool = False,
 ):
     """
     Tokenize a list of instructions.
@@ -129,7 +130,7 @@ def tokenize_instructions(
         padding=True,
         truncation=False,
         return_tensors="pt",
-        add_special_tokens=False,
+        add_special_tokens=add_special_tokens,
     )
 
     return result
@@ -139,6 +140,7 @@ def get_tokenize_fn(
     tokenizer: AutoTokenizer, 
     system: Optional[str] = None,
     use_chat_template: bool = True,
+    add_special_tokens: bool = False,
 ):
     """Get a partial function for tokenizing instructions."""
     return functools.partial(
@@ -147,6 +149,7 @@ def get_tokenize_fn(
         system=system, 
         include_trailing_whitespace=True,
         use_chat_template=use_chat_template,
+        add_special_tokens=add_special_tokens,
     )
 
 
