@@ -104,8 +104,174 @@ class ExhaustiveOptimizer:
     def step(self, *args, **kwargs):
         pass
 
+@dataclass
+class TokenSearchResult:
+    """Result of searching for a single token."""
+    token_id: Optional[int]
+    embedding: Optional[Tensor]
+    timesteps: int
+    top_k_tokens: List[Tuple[int, float]]  # List of (token_id, distance) pairs
+    success: bool
 
+def _maybe_wrap_data_parallel(model, n_gpus: int):
+    if n_gpus is None or n_gpus <= 1:
+        return model
+    if not torch.cuda.is_available():
+        return model
+    if isinstance(model, torch.nn.DataParallel):
+        return model
 
+    device = next(model.parameters()).device
+    if device.type != "cuda":
+        return model
+
+    available_gpus = torch.cuda.device_count()
+    use_gpus = min(n_gpus, available_gpus)
+    if use_gpus <= 1:
+        return model
+
+    device_ids = list(range(use_gpus))
+    return torch.nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[0])
+
+def _get_embedding_matrix(model) -> Tensor:
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module.get_input_embeddings().weight
+    return model.get_input_embeddings().weight
+
+def _score_discrete_candidates(
+    discovered_ids: List[int],
+    candidate_ids: Tensor,
+    model,
+    layer_idx: int,
+    h_target_token: Tensor,
+) -> Tensor:
+    device = next(model.parameters()).device
+    candidate_ids = candidate_ids.to(device)
+
+    if discovered_ids:
+        prefix = torch.tensor(discovered_ids, device=device).unsqueeze(0)
+        prefix = prefix.expand(candidate_ids.size(0), -1)
+        input_ids = torch.cat([prefix, candidate_ids.unsqueeze(1)], dim=1)
+    else:
+        input_ids = candidate_ids.unsqueeze(1)
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+
+    h_pred = outputs.hidden_states[layer_idx][:, -1, :]
+    target = h_target_token.to(device)
+    if target.dim() == 1:
+        target = target.unsqueeze(0)
+    distances = torch.norm(h_pred - target, dim=1)
+    return distances
+
+def _find_token_baseline(
+    token_idx: int,
+    embedding_matrix: Tensor,
+    discovered_ids: List[int],
+    model,
+    tokenizer,
+    layer_idx: int,
+    h_target: Tensor,
+    verbose: bool,
+    top_k: int,
+    batch_size: int,
+    shuffle_candidates: bool,
+) -> TokenSearchResult:
+    device = next(model.parameters()).device
+    num_tokens = embedding_matrix.size(0)
+    candidate_ids = torch.arange(num_tokens, device=device)
+
+    if shuffle_candidates:
+        candidate_ids = candidate_ids[torch.randperm(num_tokens, device=device)]
+
+    initial_desc = f'Token [{token_idx + 1:2d}/{h_target.size(0):2d}]'
+    start_time = time()
+    all_candidates: set = set()
+
+    best_token_id = None
+    best_distance = float("inf")
+    evaluated = 0
+
+    batch_size = max(1, batch_size)
+    for start in range(0, num_tokens, batch_size):
+        batch_ids = candidate_ids[start:start + batch_size]
+        distances = _score_discrete_candidates(
+            discovered_ids=discovered_ids,
+            candidate_ids=batch_ids,
+            model=model,
+            layer_idx=layer_idx,
+            h_target_token=h_target[token_idx],
+        )
+
+        if torch.isnan(distances).any():
+            final_top_k_candidates = sorted(all_candidates, key=lambda x: x[1])[:top_k]
+            return TokenSearchResult(
+                token_id=None,
+                embedding=None,
+                timesteps=evaluated,
+                top_k_tokens=final_top_k_candidates,
+                success=False,
+            )
+
+        distances_cpu = distances.detach().cpu().tolist()
+        for idx, distance_val in enumerate(distances_cpu):
+            token_id = int(batch_ids[idx].item())
+            all_candidates.add((token_id, float(distance_val)))
+
+        batch_min_distance, batch_min_idx = torch.min(distances, dim=0)
+        batch_min_distance_val = float(batch_min_distance.item())
+        if batch_min_distance_val < best_distance:
+            best_distance = batch_min_distance_val
+            best_token_id = int(batch_ids[int(batch_min_idx)].item())
+
+        evaluated += batch_ids.size(0)
+
+        if verbose:
+            token_str = tokenizer.decode([best_token_id]) if best_token_id is not None else ""
+            print(
+                '\r{}[{:5d}/{:5d}]: Best Distance: {:.2e} - Token: {:15s} - Time: {}'.format(
+                    initial_desc,
+                    evaluated,
+                    num_tokens,
+                    best_distance,
+                    format_token(token_str, length=15),
+                    format_time_minutes(time() - start_time),
+                ),
+                end=''
+            )
+
+        if best_distance < 1e-5:
+            break
+
+        if (start // batch_size + 1) % 10 == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    if verbose:
+        print()
+
+    final_top_k_candidates = sorted(all_candidates, key=lambda x: x[1])[:top_k]
+    if best_token_id is None:
+        return TokenSearchResult(
+            token_id=None,
+            embedding=None,
+            timesteps=evaluated,
+            top_k_tokens=final_top_k_candidates,
+            success=False,
+        )
+
+    return TokenSearchResult(
+        token_id=best_token_id,
+        embedding=embedding_matrix[best_token_id].clone().detach(),
+        timesteps=evaluated,
+        top_k_tokens=final_top_k_candidates,
+        success=best_distance < 1e-5,
+    )
 
 def compute_grad_and_elim(
     input_embeddings: torch.Tensor,
@@ -152,15 +318,6 @@ def compute_grad_and_elim(
     loss_cont.backward()
     return last_emb.grad.squeeze(0, 1), loss_disc, distance
 
-@dataclass
-class TokenSearchResult:
-    """Result of searching for a single token."""
-    token_id: Optional[int]
-    embedding: Optional[Tensor]
-    timesteps: int
-    top_k_tokens: List[Tuple[int, float]]  # List of (token_id, distance) pairs
-    success: bool
-
 
 def find_token(
     token_idx: int,
@@ -176,6 +333,8 @@ def find_token(
     verbose: bool = True,
     baseline: bool = False,
     top_k: int = 10,
+    batch_size: int = 256,
+    shuffle_candidates: bool = True,
 ) -> TokenSearchResult:
     """
     Find a single token that best matches the target hidden state.
@@ -194,18 +353,29 @@ def find_token(
         verbose: Whether to print progress
         baseline: Whether to use exhaustive baseline search
         top_k: Number of top candidates to track
+        batch_size: Candidate batch size for baseline search
+        shuffle_candidates: Whether to shuffle candidate order in baseline
     
     Returns:
         TokenSearchResult containing the found token info and top-k candidates
     """
+    if baseline:
+        return _find_token_baseline(
+            token_idx=token_idx,
+            embedding_matrix=embedding_matrix,
+            discovered_ids=discovered_ids,
+            model=model,
+            tokenizer=tokenizer,
+            layer_idx=layer_idx,
+            h_target=h_target,
+            verbose=verbose,
+            top_k=top_k,
+            batch_size=batch_size,
+            shuffle_candidates=shuffle_candidates,
+        )
+
     device = next(model.parameters()).device
     copy_embedding_matrix = embedding_matrix.clone().detach().requires_grad_(False)
-
-    reset_extra = embedding_matrix.size(0) // 25_000
-
-    if baseline:
-        perm = torch.randperm(copy_embedding_matrix.size(0))
-        copy_embedding_matrix = copy_embedding_matrix[perm]
 
     token_id = torch.randint(0, embedding_matrix.size(0), (1,)).item()
     
@@ -236,6 +406,7 @@ def find_token(
         ).unsqueeze(0) 
 
         grad_oracle = loss = torch.zeros_like(h_target[token_idx])
+        distance = float("inf")
 
         if baseline:
             with torch.no_grad():
@@ -247,6 +418,7 @@ def find_token(
             
             h_pred = hidden_states[layer_idx][0, -1, :].detach()
             loss = torch.nn.functional.mse_loss(h_pred, h_target[token_idx], reduction='sum')
+            distance = float(loss.item())
         else:
             grad_oracle, loss, distance = compute_grad_and_elim(
                 input_embeddings, input_embeddings_disc,
@@ -268,7 +440,7 @@ def find_token(
             )
 
         # Add all tokens as candidate
-        all_candidates.add((token_id, distance))
+        all_candidates.add((token_id, float(distance)))
 
         loss_val = loss if isinstance(loss, float) else loss.item()
 
@@ -361,6 +533,9 @@ def find_prompt(
     continue_on_failure: bool = False,
     ground_truth_ids: Optional[List[int]] = None,
     top_k: int = 10,
+    batch_size: int = 256,
+    n_gpus: int = 1,
+    shuffle_candidates: bool = True,
 ) -> InversionResult:
     """
     Find a prompt that produces the target hidden states.
@@ -378,11 +553,15 @@ def find_prompt(
         continue_on_failure: If True, continue with ground truth token when inversion fails
         ground_truth_ids: Ground truth token IDs (required if continue_on_failure=True)
         top_k: Number of top candidate tokens to track per position
+        batch_size: Candidate batch size for baseline search
+        n_gpus: Number of GPUs to use for batched evaluation
+        shuffle_candidates: Whether to shuffle candidate order in baseline
     
     Returns:
         InversionResult containing discovered tokens and metadata
     """
-    embedding_matrix = model.get_input_embeddings().weight
+    model = _maybe_wrap_data_parallel(model, n_gpus)
+    embedding_matrix = _get_embedding_matrix(model)
 
     if h_target.dim() == 1:
         h_target = h_target.unsqueeze(0)
@@ -414,6 +593,8 @@ def find_prompt(
             model, tokenizer, layer_idx, h_target,
             lr, scheduler, verbose, baseline,
             top_k=top_k,
+            batch_size=batch_size,
+            shuffle_candidates=shuffle_candidates,
         )
 
         token_end_time = time()
@@ -495,6 +676,9 @@ def inversion_attack(
     special_start_tokens: Optional[List[int]] = None,
     continue_on_failure: bool = False,
     top_k: int = 10,
+    batch_size: int = 256,
+    n_gpus: int = 1,
+    shuffle_candidates: bool = True,
 ) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]], InversionResult]:
     """
     Perform inversion attack on input IDs.
@@ -512,6 +696,9 @@ def inversion_attack(
         special_start_tokens: Special tokens to prepend
         continue_on_failure: If True, continue with ground truth when inversion fails
         top_k: Number of top candidate tokens to track
+        batch_size: Candidate batch size for baseline search
+        n_gpus: Number of GPUs to use for batched evaluation
+        shuffle_candidates: Whether to shuffle candidate order in baseline
     
     Returns:
         Tuple of (match, time, discovered_ids, times, full_result)
@@ -529,6 +716,9 @@ def inversion_attack(
         continue_on_failure=continue_on_failure,
         ground_truth_ids=ground_truth_ids,
         top_k=top_k,
+        batch_size=batch_size,
+        n_gpus=n_gpus,
+        shuffle_candidates=shuffle_candidates,
     )
     
     if not result.success or result.discovered_ids is None:
@@ -556,11 +746,15 @@ def inversion_attack_with_target(
     layer_idx: int,
     lr: float = 1.0,
     seed: int = 42,
+    baseline: bool = False,
     verbose: bool = True,
     original_ids: Optional[Tensor] = None,
     special_start_tokens: Optional[List[int]] = None,
     continue_on_failure: bool = False,
     top_k: int = 10,
+    batch_size: int = 256,
+    n_gpus: int = 1,
+    shuffle_candidates: bool = True,
 ) -> Tuple[bool, Optional[float], Optional[List[int]], Optional[List[float]], InversionResult]:
     """
     Perform inversion attack with custom target hidden states.
@@ -574,11 +768,15 @@ def inversion_attack_with_target(
         layer_idx: Layer to target for inversion
         lr: Learning rate
         seed: Random seed
+        baseline: Whether to use exhaustive baseline
         verbose: Whether to print progress
         original_ids: Optional original token IDs for comparison
         special_start_tokens: Special tokens to prepend
         continue_on_failure: If True, continue with ground truth when inversion fails
         top_k: Number of top candidate tokens to track
+        batch_size: Candidate batch size for baseline search
+        n_gpus: Number of GPUs to use for batched evaluation
+        shuffle_candidates: Whether to shuffle candidate order in baseline
     
     Returns:
         Tuple of (match_original, time, discovered_ids, times, full_result)
@@ -591,11 +789,15 @@ def inversion_attack_with_target(
     # Find prompt
     result = find_prompt(
         model, tokenizer, layer_idx, h_target, lr,
+        baseline=baseline,
         verbose=verbose,
         special_start_tokens=special_start_tokens,
         continue_on_failure=continue_on_failure,
         ground_truth_ids=ground_truth_ids,
         top_k=top_k,
+        batch_size=batch_size,
+        n_gpus=n_gpus,
+        shuffle_candidates=shuffle_candidates,
     )
     
     if not result.success or result.discovered_ids is None:

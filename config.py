@@ -40,6 +40,9 @@ class Config:
     max_prompt_length: int = 50  # Maximum prompt length to invert
     continue_on_failure: bool = False  # Continue with ground truth when inversion fails
     top_k: int = 10  # Number of top candidate tokens to track
+    batch_size: int = 1024  # Candidate batch size for baseline search
+    n_gpus: int = 1  # Number of GPUs to use for batched evaluation
+    shuffle_candidates: bool = True  # Whether to shuffle candidate order in baseline
     
     # Generation configuration
     max_new_tokens: int = 64

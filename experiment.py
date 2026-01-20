@@ -11,6 +11,7 @@ This script:
 """
 
 import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 import json
 import torch
 from typing import List, Dict, Any, Optional
@@ -45,6 +46,9 @@ def run_single_experiment(
     special_start_tokens: Optional[List[int]] = None,
     continue_on_failure: bool = False,
     top_k: int = 10,
+    batch_size: int = 256,
+    n_gpus: int = 1,
+    shuffle_candidates: bool = True,    
 ) -> Dict[str, Any]:
     """
     Run experiment for a single instruction.
@@ -61,6 +65,9 @@ def run_single_experiment(
         special_start_tokens: Special tokens to prepend
         continue_on_failure: Continue with ground truth when inversion fails
         top_k: Number of top candidate tokens to track
+        batch_size: Candidate batch size for baseline search
+        n_gpus: Number of GPUs to use for batched evaluation
+        shuffle_candidates: Whether to shuffle candidate order in baseline
     
     Returns a dict with:
     - instruction: The original instruction
@@ -170,10 +177,10 @@ def run_single_experiment(
     
     steered_match, steered_time, steered_recon_ids, steered_times, steered_inv_result = inversion_attack_with_target(
         steered_acts, model, tokenizer, inversion_layer, lr, seed, 
-        verbose=True, original_ids=input_ids,
+        verbose=True, original_ids=input_ids, baseline=True,
         special_start_tokens=special_start_tokens,
         continue_on_failure=continue_on_failure,
-        top_k=top_k,
+        top_k=top_k, batch_size=batch_size, n_gpus=n_gpus, shuffle_candidates=shuffle_candidates
     )
     
     result["steered_inversion"] = {
@@ -302,6 +309,9 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
                 special_start_tokens=config.special_start_tokens,
                 continue_on_failure=config.continue_on_failure,
                 top_k=config.top_k,
+                batch_size=config.batch_size,
+                n_gpus=config.n_gpus,
+                shuffle_candidates=config.shuffle_candidates,
             )
             results.append(result)
         except Exception as e:
@@ -314,7 +324,8 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
             })
         
         # Save intermediate results
-        results_path = os.path.join(config.output_dir, "experiment_results.json")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_path = os.path.join(config.output_dir, f"experiment_results_{timestamp}.json")
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2, default=str)
     
@@ -390,7 +401,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run steered activation inversion experiment")
     parser.add_argument("--demo", action="store_true", help="Run quick demo")
     parser.add_argument("--model", type=str, default=None, help="Model to use")
-    parser.add_argument("--device", type=str, default="cuda:1", help="Device to use")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--lr", type=float, default=1.0, help="Learning rate for inversion")
     parser.add_argument("--direction", type=str, default=None, help="Path to direction.pt")
@@ -403,6 +414,10 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=10, help="Number of top candidates to track")
     parser.add_argument("--add-special-tokens", action="store_true",
                         help="Add special tokens (like BOS token for Llama)")
+    parser.add_argument("--batch-size", type=int, default=512, help="Candidate batch size for baseline search")
+    parser.add_argument("--n-gpus", type=int, default=1, help="Number of GPUs to use for batched evaluation")
+    parser.add_argument("--shuffle-candidates", action="store_true",
+                        help="Shuffle candidate order in baseline")
     args = parser.parse_args()
     
     config = Config()
@@ -419,6 +434,9 @@ if __name__ == "__main__":
     config.add_special_tokens = args.add_special_tokens
     config.continue_on_failure = args.continue_on_failure
     config.top_k = args.top_k
+    config.batch_size = args.batch_size
+    config.n_gpus = args.n_gpus
+    config.shuffle_candidates = args.shuffle_candidates
     
     # Re-compute special tokens after setting use_chat_template
     config.special_start_tokens = config._get_default_special_tokens()
