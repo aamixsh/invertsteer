@@ -8,7 +8,7 @@ import random
 import numpy as np
 from typing import List, Optional
 from torch import Tensor
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, LlamaTokenizerFast, GemmaTokenizer, GemmaTokenizerFast, Qwen2Tokenizer, Qwen2TokenizerFast, PreTrainedTokenizerFast  
 
 
 # Llama 3 special tokens
@@ -27,6 +27,16 @@ LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM = """<|begin_of_text|><|start_header_id|>system
 
 {instruction}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
+"""
+
+GEMMA_CHAT_TEMPLATE = """<bos><start_of_turn>user
+{instruction}<end_of_turn>
+<start_of_turn>model
+"""
+
+QWEN_CHAT_TEMPLATE = """<|im_start|>user
+{instruction}<|im_end|>
+<|im_start|>assistant
 """
 
 
@@ -57,19 +67,35 @@ def load_model(model_id: str, device: str = "cuda", dtype: str = "float32"):
 
 
 def format_instruction(
+    tokenizer: AutoTokenizer,
     instruction: str,
     output: Optional[str] = None,
     system: Optional[str] = None,
     include_trailing_whitespace: bool = True
 ) -> str:
     """Format an instruction using the Llama 3 chat template."""
+
     if system is not None:
-        formatted = LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM.format(
+        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+            formatted = LLAMA3_CHAT_TEMPLATE_WITH_SYSTEM.format(
             instruction=instruction, 
             system_prompt=system
         )
+        elif isinstance(tokenizer, GemmaTokenizer) or isinstance(tokenizer, GemmaTokenizerFast):
+            formatted = GEMMA_CHAT_TEMPLATE.format(instruction=instruction)
+        elif isinstance(tokenizer, Qwen2Tokenizer) or isinstance(tokenizer, Qwen2TokenizerFast):
+            formatted = QWEN_CHAT_TEMPLATE.format(instruction=instruction)
+        else:
+            raise ValueError(f"Unsupported tokenizer: {type(tokenizer)}")
     else:
-        formatted = LLAMA3_CHAT_TEMPLATE.format(instruction=instruction)
+        if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+            formatted = LLAMA3_CHAT_TEMPLATE.format(instruction=instruction)
+        elif isinstance(tokenizer, GemmaTokenizer) or isinstance(tokenizer, GemmaTokenizerFast):
+            formatted = GEMMA_CHAT_TEMPLATE.format(instruction=instruction)
+        elif isinstance(tokenizer, Qwen2Tokenizer) or isinstance(tokenizer, Qwen2TokenizerFast):
+            formatted = QWEN_CHAT_TEMPLATE.format(instruction=instruction)
+        else:
+            raise ValueError(f"Unsupported tokenizer: {type(tokenizer)}")
 
     if not include_trailing_whitespace:
         formatted = formatted.rstrip()
@@ -105,6 +131,7 @@ def tokenize_instructions(
         if outputs is not None:
             prompts = [
                 format_instruction(
+                    tokenizer=tokenizer,
                     instruction=instruction, 
                     output=output, 
                     system=system, 
@@ -115,6 +142,7 @@ def tokenize_instructions(
         else:
             prompts = [
                 format_instruction(
+                    tokenizer=tokenizer,
                     instruction=instruction, 
                     system=system, 
                     include_trailing_whitespace=include_trailing_whitespace

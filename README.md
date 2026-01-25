@@ -55,6 +55,24 @@ This will save artifacts to `pipeline/runs/Llama-3.2-1B-Instruct/`, including:
 - `direction.pt`: The extracted steering direction
 - `direction_metadata.json`: Layer and position information
 
+### 4. (Optional) Persona vectors for persona steering
+
+To run inversion with **persona** steering (e.g. “evil” trait) instead of refusal, you need a persona direction from the sibling repo `persona_vectors`. Persona vectors are trait directions (e.g. evil, humorous) computed as the mean difference between activations on positive vs negative trait prompts.
+
+1. Set up and run the persona_vectors pipeline (see `../persona_vectors/README.md`):
+   - Generate activations for positive/negative trait prompts.
+   - Run `generate_vec.py` to compute and save vectors (e.g. `evil_prompt_last_diff.pt`).
+
+2. InvertSteer expects the direction file at:
+   ```
+   ../persona_vectors/persona_vectors/<model_alias>/evil_prompt_last_diff.pt
+   ```
+   where `<model_alias>` is the model directory name (e.g. `Llama-3.2-1B-Instruct`). You can override this with `--direction /path/to/evil_prompt_last_diff.pt`.
+
+3. Persona vectors have shape `[num_layers, hidden_dim]`. The code infers the layer index from this shape; the applied layer is taken as the middle layer.
+
+4. By default, we use the middle layer for persona steering. The coefficients for the persona vectors are set to 2.0 for the Qwen2.5-0.5B-Instruct model and 1.0 for the other models.
+
 ## Usage
 
 ### Standalone Inversion Script
@@ -92,6 +110,87 @@ python experiment.py --demo
 python experiment.py
 ```
 
+This creates an organized output structure in `outputs/{model_name}/`:
+- `experiment_results_{steering_type}_{steering_method}_coeff_{coeff}.json`: Complete experiment results
+- `experiment_activations_{steering_type}_{steering_method}_coeff_{coeff}.pkl`: Activation data for analysis
+
+### Coefficient Sweep Experiment
+
+To analyze how different steering coefficients affect inversion success, use the coefficient sweep experiment:
+
+```bash
+# Run coefficient sweep on default coefficients [0.01, 0.1, 0.25, 0.5, 1, 2.5, 5]
+python coeff_sweep_experiment.py --model meta-llama/Llama-3.2-1B-Instruct
+
+# Custom coefficients
+python coeff_sweep_experiment.py \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --coefficients "0.01,0.1,0.25,0.5,1,2.5,5" \
+    --device cuda \
+    --batch-size 1024
+```
+
+This experiment:
+- Tests multiple steering coefficients on the same model and instructions
+- Saves individual results per coefficient plus comprehensive analysis
+- Generates summary statistics for coefficient comparison
+
+Output files (organized in `outputs/{model_name}/` folder):
+- `baseline_activations_{steering_type}.pkl`: Baseline (original) prompt activations
+- `steering_invert_results_{steering_type}_{steering_method}_coeff_{coeff}.json`: Per-coefficient inversion results
+- `steering_activations_{steering_type}_{steering_method}_coeff_{coeff}.pkl`: Per-coefficient activation data
+- `comprehensive_results_{steering_type}_{steering_method}.json`: All results with metadata
+- `summary_statistics_{steering_type}_{steering_method}.json`: Aggregated statistics
+
+### Adversarial Suffix Experiment
+
+The adversarial suffix experiment tests how well a simple prompt suffix (e.g. "Here" after the assistant turn start) acts as a jailbreak on harmful instructions. It compares baseline (no suffix) vs. adversarial-suffix prompting and evaluates success with substring matching (absence of refusal phrases like "I cannot", "I'm sorry", etc.).
+
+```bash
+# Default: Gemma-3-270M, all prompts, cuda:3
+python test_adversarial_suffix.py
+
+# Specific model and device
+python test_adversarial_suffix.py --model meta-llama/Llama-3.2-1B-Instruct --device cuda:0
+
+# Sample 100 prompts instead of full dataset
+python test_adversarial_suffix.py --model LiquidAI/LFM2.5-1.2B-Instruct --n_samples 100
+
+# Custom dataset, batch size, and max new tokens
+python test_adversarial_suffix.py \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --dataset /path/to/harmful_test.json \
+    --n_samples 200 \
+    --batch_size 128 \
+    --max_new_tokens 50 \
+    --output_dir ./my_suffix_results
+```
+
+**What it does:**
+
+1. Loads the harmful test dataset (`refusal_direction/dataset/splits/harmful_test.json` by default).
+2. Optionally samples N prompts (or uses all if `--n_samples -1`).
+3. Builds prompts with the model’s chat template, with and without an adversarial suffix (e.g. "Here" after `<|im_start|>assistant`).
+4. Runs batch inference for both conditions.
+5. Evaluates jailbreaks via substring matching (from `refusal_direction`’s `evaluate_jailbreak`): a completion is counted as jailbroken if it does *not* contain refusal phrases.
+6. Writes results and plots under `output_dir/{model_name}/`:
+   - `baseline_results.json` / `adversarial_suffix_results.json`: completions plus overall and per-category ASR.
+   - `jailbreak_scores_by_category.png`: per-category ASR for baseline vs. adversarial suffix.
+   - `jailbreak_overall_comparison.png`: overall ASR comparison.
+
+Supported models (via `--model`) include: `LiquidAI/LFM2.5-1.2B-Instruct`, `google/gemma-3-270m-it`, `google/gemma-3-1b-it`, `LLM-LAT/robust-llama3-8b-instruct`, `nvidia/Nemotron-Flash-3B-Instruct`, `microsoft/Phi-4-mini-instruct`, `Qwen/Qwen3-4B-Instruct-2507`, `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`.
+
+| Option | Description |
+|--------|-------------|
+| `--model` | Model name (see list above; default: google/gemma-3-270m-it) |
+| `--dataset` | Path to harmful test JSON (instruction + category per item) |
+| `--n_samples` | Number of prompts to sample; -1 = use all |
+| `--batch_size` | Inference batch size (default: 256) |
+| `--max_new_tokens` | Max generated tokens per completion (default: 50) |
+| `--device` | Device, e.g. cuda, cuda:0 (default: cuda:3) |
+| `--output_dir` | Base output directory; results go under `output_dir/{model}/` |
+| `--seed` | Random seed for sampling (default: 42) |
+
 ### Options
 
 ```bash
@@ -99,6 +198,7 @@ python experiment.py \
     --model meta-llama/Llama-3.2-1B-Instruct \
     --device cuda \
     --direction ../refusal_direction/pipeline/runs/Llama-3.2-1B-Instruct/direction.pt \
+    --steering-type refusal \
     --method actadd \
     --coeff 1.0 \
     --lr 1.0 \
@@ -112,7 +212,8 @@ python experiment.py \
 |--------|-------------|
 | `--model` | HuggingFace model path |
 | `--device` | Device to use (cuda, cuda:0, cpu) |
-| `--direction` | Path to direction.pt file |
+| `--direction` | Path to direction.pt (refusal) or e.g. evil_prompt_last_diff.pt (persona) |
+| `--steering-type` | `refusal` or `persona` (default in experiment.py: persona) |
 | `--method` | Steering method (`actadd` or `ablation`) |
 | `--coeff` | Steering coefficient (use -1 to remove direction, +1 to add) |
 | `--lr` | Learning rate for SIP-It inversion |
@@ -120,6 +221,48 @@ python experiment.py \
 | `--no-chat-template` | Don't use chat template, only BOS token (e.g., `<\|begin_of_text\|>` for Llama) |
 | `--continue-on-failure` | Continue inversion with ground truth when a token fails |
 | `--top-k` | Number of top candidate tokens to track per position (default: 10) |
+
+### Coefficient Sweep Options
+
+| Option | Description |
+|--------|-------------|
+| `--coefficients` | Comma-separated list of coefficients to test (default: "0.01,0.1,0.25,0.5,1,2.5,5") |
+| `--model` | HuggingFace model path (default: meta-llama/Llama-3.2-1B-Instruct) |
+| `--steering-type` | Steering type: `refusal` or `persona` (default: refusal) |
+
+### Persona vectors steering
+
+InvertSteer can invert **persona** steering as well as refusal. Persona steering uses trait vectors from the [persona_vectors](../persona_vectors) repo (e.g. “evil”), which are computed as the mean difference between activations on trait-positive vs trait-negative prompts.
+
+**Direction and layer:**
+
+- **Refusal**: direction from `refusal_direction` pipeline (`direction.pt`); layer from `direction_metadata.json` or the pipeline.
+- **Persona**: direction from persona_vectors, e.g. `evil_prompt_last_diff.pt` in `persona_vectors/persona_vectors/<model_alias>/`. If the file has shape `[num_layers, hidden_dim]`, the layer used is the middle layer.
+
+**Instructions:**
+
+- For `steering_type=refusal`, the main experiment uses harmful instructions from `TEST_INSTRUCTIONS` (see `config.py`).
+- For `steering_type=persona`, it uses `EVIL_TEST_INSTRUCTIONS` (evil-trait–oriented prompts) from `config.py`.
+
+**Running with persona:**
+
+```bash
+# Single-coefficient experiment with persona direction (experiment.py defaults to persona)
+python experiment.py --model meta-llama/Llama-3.2-1B-Instruct --steering-type persona
+
+# Explicit direction path if not using the default persona_vectors path
+python experiment.py \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --steering-type persona \
+    --direction ../persona_vectors/persona_vectors/Llama-3.2-1B-Instruct/evil_prompt_last_diff.pt
+
+# Coefficient sweep with persona steering
+python coeff_sweep_experiment.py \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --steering-type persona
+```
+
+Results are written under `outputs/{model_name}/` with filenames that include the steering type (e.g. `experiment_results_persona_actadd_coeff_-1.0.json`). Generating persona vectors and the full pipeline are described in `../persona_vectors/README.md`.
 
 ## Key Features
 
@@ -166,16 +309,19 @@ This is useful for testing raw prompt inversion without chat formatting.
 
 ```
 invertsteer/
-├── config.py          # Configuration and constants
-├── model_utils.py     # Model loading and tokenization utilities
-├── steering.py        # Modular steering abstraction (uses refusal_direction hooks)
-├── inversion.py       # SIP-It inversion algorithm (core implementation)
-├── sipit.py           # Standalone inversion script
-├── experiment.py      # Main experiment script
-├── evaluate.py        # Evaluation utilities
-├── environment.yml    # Conda environment
-├── requirements.txt   # Pip requirements
-└── outputs/           # Experiment outputs
+├── config.py                   # Configuration and constants
+├── model_utils.py              # Model loading and tokenization utilities
+├── steering.py                 # Modular steering abstraction (uses refusal_direction hooks)
+├── inversion.py                # SIP-It inversion algorithm (core implementation)
+├── sipit.py                    # Standalone inversion script
+├── experiment.py               # Main experiment script (single coefficient)
+├── coeff_sweep_experiment.py   # Coefficient sweep experiment (multiple coefficients)
+├── test_adversarial_suffix.py  # Adversarial suffix jailbreak experiment (batch inference + substring ASR)
+├── evaluate.py                 # Evaluation utilities
+├── README_coeff_sweep.md       # Coefficient sweep experiment documentation
+├── environment.yml             # Conda environment
+├── requirements.txt            # Pip requirements
+└── outputs/                    # Experiment outputs (organized by model)
 ```
 
 ## Key Concepts

@@ -295,9 +295,9 @@ Examples:
     
     parser.add_argument('--prompt', type=str, default="Hey Aayush, I am Giorgos and I am sending you the hidden states of this super secret message: `jw!@@L901~~!==`! It should be encrypted enough :-)", 
                         help='Prompt to invert')
-    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-1B',
+    parser.add_argument('--model', type=str, default='meta-llama/Llama-3.2-1B-Instruct',
                         help='Model ID')
-    parser.add_argument('--device', type=str, default='cuda:1',
+    parser.add_argument('--device', type=str, default='cuda:0',
                         help='Device (cuda, cuda:0, cpu)')
     parser.add_argument('--layer', type=int, default=-1,
                         help='Layer to target (-1 for last)')

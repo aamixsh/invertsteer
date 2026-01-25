@@ -34,10 +34,13 @@ class SteeringConfig:
     layer: int  # Layer to apply the steering
     method: str = "actadd"  # "actadd" or "ablation"
     coeff: float = 1.0  # Coefficient for actadd (positive = add, negative = subtract)
-    
+    steering_type: str = "refusal"  # "refusal" or "persona"
+
     def __post_init__(self):
         if self.method not in ["actadd", "ablation"]:
             raise ValueError(f"Unknown steering method: {self.method}. Use 'actadd' or 'ablation'.")
+        if self.steering_type not in ["refusal", "persona"]:
+            raise ValueError(f"Unknown steering type: {self.steering_type}. Use 'refusal' or 'persona'.")
 
 
 def load_steering_direction(direction_path: str, device: str = "cuda") -> Tuple[Tensor, int, Dict[str, Any]]:
@@ -70,7 +73,11 @@ def load_steering_direction(direction_path: str, device: str = "cuda") -> Tuple[
         dir_tensor = direction.to(device)
         layer = -1
         metadata = {}
-    
+
+    if len(direction.shape) == 2:
+        layer = (direction.shape[0] - 1) // 2
+        return dir_tensor[layer], layer, metadata
+
     # Try to load metadata from companion file
     metadata_path = os.path.join(os.path.dirname(direction_path), 'direction_metadata.json')
     if os.path.exists(metadata_path):
@@ -171,19 +178,13 @@ def generate_with_steering(
     Returns:
         List of generated text strings (excluding the prompt)
     """
-    from transformers import GenerationConfig
-    
-    generation_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    
     with steering_context(model, steering_config):
         outputs = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
         )
     
     # Remove prompt tokens
@@ -215,14 +216,13 @@ def get_hidden_states_with_steering(
         with torch.no_grad():
             outputs = model(
                 input_ids=input_ids,
-                attention_mask=attention_mask,
                 output_hidden_states=True,
                 use_cache=False,
             )
     
     # hidden_states is a tuple of (embedding, layer1, layer2, ..., layerN)
-    hidden_states = outputs.hidden_states[layer_idx]
-    return hidden_states
+    hidden_states = outputs.hidden_states[layer_idx][0]
+    return hidden_states.detach()
 
 
 def get_hidden_states_iterative_with_steering(
@@ -290,25 +290,19 @@ def compare_generations(
     Returns:
         Tuple of (baseline_generations, steered_generations)
     """
-    from transformers import GenerationConfig
-    
     # Tokenize
     inputs = tokenize_fn(instructions=instructions)
     input_ids = inputs.input_ids.to(model.device)
     attention_mask = inputs.attention_mask.to(model.device)
-    
-    generation_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    
+
     # Baseline generation (no steering)
     with torch.no_grad():
         baseline_outputs = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
         )
     baseline_text = tokenizer.batch_decode(
         baseline_outputs[:, input_ids.size(1):], 

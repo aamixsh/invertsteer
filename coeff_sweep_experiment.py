@@ -1,22 +1,16 @@
 """
-Main experiment script for inverting steered activations.
+Coefficient sweep experiment for inverting steered activations.
 
-This script:
-1. Loads a steering direction from refusal_direction pipeline output
-2. For a set of test prompts:
-   a. Compares baseline vs steered generations (using original model with layer norm)
-   b. Extracts baseline and steered activations at the steering layer
-   c. Attempts to invert both back to prompts
-3. Evaluates and compares the results
+This script runs the steered activation inversion experiment across multiple
+steering coefficients to analyze how coefficient strength affects inversion success.
 """
 
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 import json
 import torch
-import pickle
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import pickle
 
 from config import Config, TEST_INSTRUCTIONS, EVIL_TEST_INSTRUCTIONS
 from model_utils import load_model, get_tokenize_fn, set_seed, get_num_layers
@@ -24,10 +18,10 @@ from steering import (
     SteeringConfig,
     load_steering_direction,
     compare_generations,
-    get_hidden_states_with_steering,
+    get_hidden_states_iterative_with_steering,
 )
 from inversion import (
-    extract_hidden_states,
+    extract_hidden_states_iterative,
     inversion_attack,
     inversion_attack_with_target,
     compute_activation_mse,
@@ -35,16 +29,16 @@ from inversion import (
 )
 
 
-def run_single_experiment(
+def run_single_experiment_with_coeff(
     model,
     tokenizer,
     tokenize_fn,
     instruction: str,
     steering_config: SteeringConfig,
+    coeff: float,
     lr: float = 1.0,
     seed: int = 42,
     max_new_tokens: int = 64,
-    invert_original: bool = False,
     linear: bool = False,
     cmaes: bool = False,
     special_start_tokens: Optional[List[int]] = None,
@@ -57,18 +51,18 @@ def run_single_experiment(
     cmaes_stdev_init: float = 0.1,
 ) -> Dict[str, Any]:
     """
-    Run experiment for a single instruction.
-    
+    Run experiment for a single instruction and coefficient.
+
     Args:
         model: The model (with original layer norm)
         tokenizer: The tokenizer
         tokenize_fn: Function to tokenize instructions
         instruction: The instruction to test
-        steering_config: Configuration for the steering
+        steering_config: Base configuration for the steering (coeff will be overridden)
+        coeff: The steering coefficient to use
         lr: Learning rate for inversion
         seed: Random seed
         max_new_tokens: Max tokens for generation
-        invert_original: Whether to invert the original prompt
         linear: Whether to invert using baseline linear search
         special_start_tokens: Special tokens to prepend
         continue_on_failure: Continue with ground truth when inversion fails
@@ -76,24 +70,26 @@ def run_single_experiment(
         batch_size: Candidate batch size for baseline search
         n_gpus: Number of GPUs to use for batched evaluation
         shuffle_candidates: Whether to shuffle candidate order in baseline
-    
-    Returns a dict with:
-    - instruction: The original instruction
-    - original_ids: Original token IDs
-    - baseline_generation: Model output without steering
-    - steered_generation: Model output with steering
-    - baseline_inversion: Result of inverting baseline activations
-    - steered_inversion: Result of inverting steered activations
-    - metrics: Various metrics (MSE, match, etc.)
+
+    Returns a dict with experiment results for this coefficient.
     """
+    # Override the coefficient in steering config
+    steering_config = SteeringConfig(
+        direction=steering_config.direction,
+        layer=steering_config.layer,
+        method=steering_config.method,
+        coeff=coeff,
+        steering_type=steering_config.steering_type,
+    )
+
     result = {
         "instruction": instruction,
         "timestamp": datetime.now().isoformat(),
         "steering_layer": steering_config.layer,
         "steering_method": steering_config.method,
-        "steering_coeff": steering_config.coeff,
+        "steering_coeff": coeff,
     }
-    
+
     # Tokenize the instruction
     inputs = tokenize_fn(instructions=[instruction])
     input_ids = inputs.input_ids.to(model.device)
@@ -102,16 +98,16 @@ def run_single_experiment(
     seq_len = input_ids.size(1)
     result["seq_len"] = seq_len
     result["original_ids"] = input_ids[0].tolist()
-    
+
     print(f"\n{'='*60}")
     print(f"Instruction: {instruction[:80]}...")
     print(f"Tokenized length: {seq_len}")
-    print(f"Steering: layer={steering_config.layer}, method={steering_config.method}, coeff={steering_config.coeff}")
+    print(f"Steering: layer={steering_config.layer}, method={steering_config.method}, coeff={coeff}")
     print(f"{'='*60}")
-    
+
     # Inversion layer = steering layer (the layer where actadd is applied)
     inversion_layer = steering_config.layer + 1
-    
+
     # Step 1: Compare baseline vs steered generations
     print("\n[Step 1] Comparing baseline vs steered generations...")
     baseline_gen, steered_gen = compare_generations(
@@ -120,18 +116,18 @@ def run_single_experiment(
     )
     result["baseline_generation"] = baseline_gen[0]
     result["steered_generation"] = steered_gen[0]
-    
-    print(f"Baseline: {baseline_gen[0]}")
-    print(f"Steered:  {steered_gen[0]}")
-    
+
+    print(f"Baseline: {baseline_gen[0][:100]}...")
+    print(f"Steered:  {steered_gen[0][:100]}...")
+
     # Step 2: Extract activations at the steering layer
     print(f"\n[Step 2] Extracting activations at layer {inversion_layer}...")
 
-    baseline_acts = extract_hidden_states(
+    baseline_acts = extract_hidden_states_iterative(
         input_ids, model, inversion_layer
     )
 
-    steered_acts = get_hidden_states_with_steering(
+    steered_acts = get_hidden_states_iterative_with_steering(
         model, input_ids, steering_config, inversion_layer
     )
 
@@ -147,57 +143,11 @@ def run_single_experiment(
     print(f"Activation difference (L2): {act_diff:.4f}")
     print(f"Per-token difference: {act_diff_per_token:.4f}")
 
-    if invert_original:
-        # Step 3: Baseline inversion
-        print("\n[Step 3] Inverting baseline activations...")
-        
-        baseline_match, baseline_time, baseline_recon_ids, baseline_times, baseline_inv_result = inversion_attack(
-            input_ids, model, tokenizer, inversion_layer, lr, seed,
-            linear=linear if not cmaes else False,
-            cmaes=cmaes,
-            special_start_tokens=special_start_tokens,
-            continue_on_failure=continue_on_failure,
-            top_k=top_k,
-            batch_size=batch_size,
-            n_gpus=n_gpus,
-            shuffle_candidates=shuffle_candidates,
-            cmaes_max_iterations=cmaes_max_iterations,
-            cmaes_stdev_init=cmaes_stdev_init,
-        )
-        
-        result["baseline_inversion"] = {
-            "match": baseline_match,
-            "time": baseline_time,
-            "reconstructed_ids": baseline_recon_ids,
-            "failed_positions": baseline_inv_result.failed_positions if baseline_inv_result else [],
-        }
-        
-        # Store top-k tokens for analysis
-        if baseline_inv_result and baseline_inv_result.top_k_per_position:
-            result["baseline_inversion"]["top_k_per_position"] = [
-                [(tid, dist) for tid, dist in pos_top_k]
-                for pos_top_k in baseline_inv_result.top_k_per_position
-            ]
-        
-        if baseline_recon_ids:
-            baseline_recon_text = tokenizer.decode(baseline_recon_ids)
-            result["baseline_inversion"]["reconstructed_text"] = baseline_recon_text
-            
-            recon_ids_tensor = torch.tensor(baseline_recon_ids).unsqueeze(0).to(model.device)
-            baseline_mse = compute_activation_mse(
-                model, recon_ids_tensor, baseline_acts, inversion_layer
-            )
-            result["baseline_inversion"]["mse"] = baseline_mse
-
-        # Print top-k
-        if baseline_inv_result:
-            print_top_k_tokens(baseline_inv_result, tokenizer, result["original_ids"])
-    
     # Step 4: Steered inversion
     print("\n[Step 4] Inverting steered activations...")
-    
+
     steered_match, steered_time, steered_recon_ids, steered_times, steered_inv_result = inversion_attack_with_target(
-        steered_acts, model, tokenizer, inversion_layer, lr, seed, 
+        steered_acts, model, tokenizer, inversion_layer, lr, seed,
         verbose=True, original_ids=input_ids, linear=True, cmaes=False,
         special_start_tokens=special_start_tokens,
         continue_on_failure=continue_on_failure,
@@ -205,43 +155,43 @@ def run_single_experiment(
         cmaes_max_iterations=cmaes_max_iterations,
         cmaes_stdev_init=cmaes_stdev_init,
     )
-    
+
     result["steered_inversion"] = {
         "match_original": steered_match,
         "time": steered_time,
         "reconstructed_ids": steered_recon_ids,
         "failed_positions": steered_inv_result.failed_positions if steered_inv_result else [],
     }
-    
+
     # Store top-k tokens for analysis
     if steered_inv_result and steered_inv_result.top_k_per_position:
         result["steered_inversion"]["top_k_per_position"] = [
             [(tid, dist) for tid, dist in pos_top_k]
             for pos_top_k in steered_inv_result.top_k_per_position
         ]
-    
+
     if steered_recon_ids:
         steered_recon_text = tokenizer.decode(steered_recon_ids)
         result["steered_inversion"]["reconstructed_text"] = steered_recon_text
-        
+
         recon_ids_tensor = torch.tensor(steered_recon_ids).unsqueeze(0).to(model.device)
         steered_mse = compute_activation_mse(
             model, recon_ids_tensor, steered_acts, inversion_layer
         )
         result["steered_inversion"]["mse_to_target"] = steered_mse
-        
+
         baseline_mse_from_steered = compute_activation_mse(
             model, recon_ids_tensor, baseline_acts, inversion_layer
         )
         result["steered_inversion"]["mse_to_baseline"] = baseline_mse_from_steered
-        
+
         # Step 5: Test if reconstructed prompt has same behavior
         print("\n[Step 5] Testing reconstructed prompt...")
-        
+
         recon_inputs = tokenize_fn(instructions=[steered_recon_text])
         recon_input_ids = recon_inputs.input_ids.to(model.device)
         recon_attention_mask = recon_inputs.attention_mask.to(model.device)
-        
+
         with torch.no_grad():
             recon_outputs = model.generate(
                 input_ids=recon_input_ids,
@@ -252,21 +202,27 @@ def run_single_experiment(
             )
         recon_gen_tokens = recon_outputs[0, recon_input_ids.size(1):]
         recon_generation = tokenizer.decode(recon_gen_tokens)
-        
+
         result["reconstructed_prompt_generation"] = recon_generation
         print(f"Reconstructed prompt generation: {recon_generation[:100]}...")
-    
+
     # Print top-k
     if steered_inv_result:
         print_top_k_tokens(steered_inv_result, tokenizer, result["original_ids"])
-    
+
     return result
 
 
-def run_experiment(config: Config, instructions: Optional[List[str]] = None):
-    """Run the full experiment."""
+def run_coeff_sweep_experiment(
+    config: Config,
+    coefficients: List[float],
+    instructions: Optional[List[str]] = None
+):
+    """Run the coefficient sweep experiment."""
     print("="*60)
-    print("INVERTING STEERED ACTIVATIONS EXPERIMENT")
+    print("COEFFICIENT SWEEP: INVERTING STEERED ACTIVATIONS")
+    print(f"Model: {config.model_id}")
+    print(f"Coefficients: {coefficients}")
     print("="*60)
 
     set_seed(config.seed)
@@ -282,13 +238,9 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
     model, tokenizer = load_model(config.model_id, config.device, config.dtype)
     tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
 
-    # print(model)
-    # input()
-
     n_layers = get_num_layers(model)
     print(f"Model has {n_layers} layers")
     print(f"Use chat template: {config.use_chat_template}")
-    # print(f"Special start tokens: {config.special_start_tokens}")
 
     # Step 1: Load steering direction
     print("\n" + "="*60)
@@ -307,22 +259,22 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
     direction, layer, metadata = load_steering_direction(direction_path, config.device)
     print(f"Loaded direction from: {direction_path}")
     print(f"Steering layer: {layer}")
-    print(f"Direction norm: {direction.norm().item():.4f}")
+    print(".4f")
     print(f"Metadata: {metadata}")
 
-    steering_config = SteeringConfig(
+    base_steering_config = SteeringConfig(
         direction=direction,
         layer=layer,
         method=config.steering_method,
-        coeff=config.steering_coeff,
+        coeff=1.0,  # Will be overridden for each coefficient
         steering_type=config.steering_type,
     )
-    
-    # Step 2: Run experiments
+
+    # Step 2: Run experiments for each coefficient
     print("\n" + "="*60)
-    print("STEP 2: RUNNING INVERSION EXPERIMENTS")
+    print("STEP 2: RUNNING COEFFICIENT SWEEP")
     print("="*60)
-    
+
     if instructions is None:
         if config.steering_type == "refusal":
             instructions = TEST_INSTRUCTIONS
@@ -330,171 +282,230 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
             instructions = EVIL_TEST_INSTRUCTIONS
         else:
             raise ValueError(f"Unknown steering type: {config.steering_type}")
-    
-    results = []
-    for instruction in instructions:
-        try:
-            result = run_single_experiment(
-                model, tokenizer, tokenize_fn,
-                instruction, steering_config,
-                lr=config.learning_rate, seed=config.seed,
-                max_new_tokens=config.max_new_tokens,
-                invert_original=config.invert_original,
-                linear=config.linear,
-                cmaes=config.cmaes,
-                special_start_tokens=config.special_start_tokens,
-                continue_on_failure=config.continue_on_failure,
-                top_k=config.top_k,
-                batch_size=config.batch_size,
-                n_gpus=config.n_gpus,
-                shuffle_candidates=config.shuffle_candidates,
-                cmaes_max_iterations=config.cmaes_max_iterations,
-                cmaes_stdev_init=config.cmaes_stdev_init,
+
+    all_results = {}
+    model_alias = config.model_id.split('/')[-1]
+
+    for coeff in coefficients:
+        print(f"\n{'*'*60}")
+        print(f"RUNNING EXPERIMENTS FOR COEFFICIENT: {coeff}")
+        print(f"{'*'*60}")
+
+        results = []
+        for instruction in instructions:
+            try:
+                result = run_single_experiment_with_coeff(
+                    model, tokenizer, tokenize_fn,
+                    instruction, base_steering_config, coeff,
+                    lr=config.learning_rate, seed=config.seed,
+                    max_new_tokens=config.max_new_tokens,
+                    linear=config.linear,
+                    cmaes=config.cmaes,
+                    special_start_tokens=config.special_start_tokens,
+                    continue_on_failure=config.continue_on_failure,
+                    top_k=config.top_k,
+                    batch_size=config.batch_size,
+                    n_gpus=config.n_gpus,
+                    shuffle_candidates=config.shuffle_candidates,
+                    cmaes_max_iterations=config.cmaes_max_iterations,
+                    cmaes_stdev_init=config.cmaes_stdev_init,
+                )
+                results.append(result)
+            except Exception as e:
+                import traceback
+                print(f"Error processing instruction with coeff {coeff}: {e}")
+                traceback.print_exc()
+                results.append({
+                    "instruction": instruction,
+                    "steering_coeff": coeff,
+                    "error": str(e),
+                })
+
+            # Save intermediate results for this coefficient
+            coeff_results_path = os.path.join(
+                model_output_dir,
+                f"steering_invert_results_{config.steering_type}_{config.steering_method}_coeff_{coeff}.json"
             )
-            results.append(result)
-        except Exception as e:
-            import traceback
-            print(f"Error processing instruction: {e}")
-            traceback.print_exc()
-            results.append({
-                "instruction": instruction,
-                "error": str(e),
-            })
-        
-        # Save intermediate results
-        results_path = os.path.join(
-            model_output_dir,
-            f"experiment_results_{config.steering_type}_{config.steering_method}_coeff_{config.steering_coeff}.json"
-        )
 
-        # Separate activations from JSON results for storage
-        results_for_json = []
-        activations_data = {
-            "steering_coeff": config.steering_coeff,
-            "steering_layer": layer,
-            "inversion_layer": layer + 1,
-            "results": []
-        }
+            # Separate activations from JSON results for storage
+            results_for_json = []
+            activations_data = {
+                "coefficient": coeff,
+                "steering_layer": layer,
+                "inversion_layer": layer + 1,
+                "results": []
+            }
 
-        for result in results:
-            result_copy = result.copy()
-            # Extract activations for separate storage
-            baseline_acts = result_copy.pop("baseline_activations")
-            steered_acts = result_copy.pop("steered_activations")
+            for result in results:
+                result_copy = result.copy()
+                # Extract activations for separate storage
+                baseline_acts = result_copy.pop("baseline_activations")
+                steered_acts = result_copy.pop("steered_activations")
 
-            activations_data["results"].append({
+                activations_data["results"].append({
+                    "instruction": result["instruction"],
+                    "baseline_activations": baseline_acts,
+                    "steered_activations": steered_acts,
+                    "original_ids": result["original_ids"],
+                    "seq_len": result["seq_len"]
+                })
+
+                results_for_json.append(result_copy)
+
+            # Save JSON results (without large tensors)
+            with open(coeff_results_path, 'w') as f:
+                json.dump(results_for_json, f, indent=2, default=str)
+
+            # Save activations separately
+            activations_path = os.path.join(
+                model_output_dir,
+                f"steering_activations_{config.steering_type}_{config.steering_method}_coeff_{coeff}.pkl"
+            )
+            with open(activations_path, 'wb') as f:
+                pickle.dump(activations_data, f)
+
+        all_results[str(coeff)] = results
+
+        # Summary for this coefficient
+        print(f"\n{'='*40} SUMMARY FOR COEFF {coeff} {'='*40}")
+
+        n_steered_match = sum(1 for r in results if r.get("steered_inversion", {}).get("match_original", False))
+        n_steered_failed = sum(1 for r in results if r.get("steered_inversion", {}).get("failed_positions", []))
+
+        print(f"Total experiments: {len(results)}")
+        print(f"Steered matches original: {n_steered_match}/{len(results)}")
+        print(f"Steered with failures: {n_steered_failed}/{len(results)}")
+        print(f"Steering invert results saved to: {coeff_results_path}")
+        print(f"Activations saved to: {activations_path}")
+
+    # Step 3: Save comprehensive results
+    print("\n" + "="*60)
+    print("STEP 3: SAVING COMPREHENSIVE RESULTS")
+    print("="*60)
+
+    # Create baseline activations file (same for all coefficients)
+    baseline_activations_data = {
+        "model_id": config.model_id,
+        "steering_type": config.steering_type,
+        "steering_layer": layer,
+        "inversion_layer": layer + 1,
+        "instructions": instructions,
+        "results": []
+    }
+
+    # Extract baseline activations from the first coefficient's results
+    if all_results:
+        first_coeff = list(all_results.keys())[0]
+        first_results = all_results[first_coeff]
+        for result in first_results:
+            baseline_activations_data["results"].append({
                 "instruction": result["instruction"],
-                "baseline_activations": baseline_acts,
-                "steered_activations": steered_acts,
+                "baseline_activations": result["baseline_activations"],
                 "original_ids": result["original_ids"],
                 "seq_len": result["seq_len"]
             })
 
-            results_for_json.append(result_copy)
+    baseline_path = os.path.join(model_output_dir, f"baseline_activations_{config.steering_type}.pkl")
+    with open(baseline_path, 'wb') as f:
+        pickle.dump(baseline_activations_data, f)
 
-        # Save JSON results (without large tensors)
-        with open(results_path, 'w') as f:
-            json.dump(results_for_json, f, indent=2, default=str)
+    comprehensive_results = {
+        "experiment_metadata": {
+            "model_id": config.model_id,
+            "steering_type": config.steering_type,
+            "steering_method": config.steering_method,
+            "steering_layer": layer,
+            "coefficients_tested": coefficients,
+            "instructions_tested": instructions,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "results": all_results
+    }
 
-        # Save activations separately
-        activations_path = os.path.join(
-            model_output_dir,
-            f"experiment_activations_{config.steering_type}_{config.steering_method}_coeff_{config.steering_coeff}.pkl"
-        )
-        with open(activations_path, 'wb') as f:
-            pickle.dump(activations_data, f)
-    
-    # Summary
+    comprehensive_path = os.path.join(
+        model_output_dir,
+        f"comprehensive_results_{config.steering_type}_{config.steering_method}.json"
+    )
+    with open(comprehensive_path, 'w') as f:
+        json.dump(comprehensive_results, f, indent=2, default=str)
+
+    print(f"Baseline activations saved to: {baseline_path}")
+    print(f"Comprehensive results saved to: {comprehensive_path}")
+
+    # Step 4: Generate summary statistics
     print("\n" + "="*60)
-    print("EXPERIMENT SUMMARY")
+    print("STEP 4: GENERATING SUMMARY STATISTICS")
     print("="*60)
-    
-    n_baseline_match = sum(1 for r in results if r.get("baseline_inversion", {}).get("match", False))
-    n_steered_match = sum(1 for r in results if r.get("steered_inversion", {}).get("match_original", False))
-    n_baseline_failed = sum(1 for r in results if r.get("baseline_inversion", {}).get("failed_positions", []))
-    n_steered_failed = sum(1 for r in results if r.get("steered_inversion", {}).get("failed_positions", []))
-    
-    print(f"Total experiments: {len(results)}")
-    print(f"Baseline exact matches: {n_baseline_match}/{len(results)}")
-    print(f"Baseline with failures: {n_baseline_failed}/{len(results)}")
-    print(f"Steered matches original: {n_steered_match}/{len(results)}")
-    print(f"Steered with failures: {n_steered_failed}/{len(results)}")
 
-    print(f"\nExperiment results saved to: {results_path}")
-    print(f"Activations saved to: {activations_path}")
+    summary_stats = {}
+    for coeff in coefficients:
+        coeff_str = str(coeff)
+        results = all_results[coeff_str]
+
+        stats = {
+            "total_experiments": len(results),
+            "steered_matches_original": sum(1 for r in results if r.get("steered_inversion", {}).get("match_original", False)),
+            "steered_with_failures": sum(1 for r in results if r.get("steered_inversion", {}).get("failed_positions", [])),
+            "avg_activation_diff_total": sum(r.get("activation_diff_total", 0) for r in results) / len(results),
+            "avg_activation_diff_per_token": sum(r.get("activation_diff_per_token", 0) for r in results) / len(results),
+        }
+
+        # Add MSE stats if available
+        mse_to_target = [r.get("steered_inversion", {}).get("mse_to_target") for r in results if r.get("steered_inversion", {}).get("mse_to_target") is not None]
+        mse_to_baseline = [r.get("steered_inversion", {}).get("mse_to_baseline") for r in results if r.get("steered_inversion", {}).get("mse_to_baseline") is not None]
+
+        if mse_to_target:
+            stats["avg_mse_to_target"] = sum(mse_to_target) / len(mse_to_target)
+        if mse_to_baseline:
+            stats["avg_mse_to_baseline"] = sum(mse_to_baseline) / len(mse_to_baseline)
+
+        summary_stats[coeff_str] = stats
+
+        print(f"Coefficient {coeff}:")
+        print(f"  Matches: {stats['steered_matches_original']}/{stats['total_experiments']}")
+        print(f"  Failures: {stats['steered_with_failures']}/{stats['total_experiments']}")
+        print(".4f")
+        print(".4f")
+        if "avg_mse_to_target" in stats:
+            print(".4f")
+        if "avg_mse_to_baseline" in stats:
+            print(".4f")
+        print()
+
+    summary_path = os.path.join(
+        model_output_dir,
+        f"summary_statistics_{config.steering_type}_{config.steering_method}.json"
+    )
+    with open(summary_path, 'w') as f:
+        json.dump(summary_stats, f, indent=2)
+
+    print(f"Summary statistics saved to: {summary_path}")
     print(f"\nAll results saved in: {model_output_dir}")
 
-    return results
-
-
-def demo(config: Config):
-    """Run a quick demo with a single instruction."""
-    print("="*60)
-    print("DEMO: INVERTING STEERED ACTIVATIONS")
-    print("="*60)
-    
-    set_seed(config.seed)
-    
-    print(f"\nLoading model: {config.model_id}")
-    model, tokenizer = load_model(config.model_id, config.device, config.dtype)
-    tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
-    
-    direction_path = config.get_direction_path()
-    if not os.path.exists(direction_path):
-        raise FileNotFoundError(
-            f"Direction file not found: {direction_path}\n"
-            f"Please run the refusal_direction pipeline first."
-        )
-    
-    direction, layer, metadata = load_steering_direction(direction_path, config.device)
-    print(f"Loaded direction from layer {layer}")
-    
-    steering_config = SteeringConfig(
-        direction=direction,
-        layer=layer,
-        method=config.steering_method,
-        coeff=config.steering_coeff,
-        steering_type=config.steering_type,
-    )
-    
-    test_instructions = TEST_INSTRUCTIONS
-    
-    print("\n--- Comparing generations ---")
-    baseline_gens, steered_gens = compare_generations(
-        model, tokenizer, test_instructions, steering_config,
-        tokenize_fn, max_new_tokens=config.max_new_tokens
-    )
-    
-    for i, (instr, base, steered) in enumerate(zip(test_instructions, baseline_gens, steered_gens)):
-        print(f"\n[{i+1}] Instruction: {instr[:60]}...")
-        print(f"    Baseline: {base[:80]}...")
-        print(f"    Steered:  {steered[:80]}...")
-    
-    print("\nDemo complete!")
+    return all_results, summary_stats
 
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Run steered activation inversion experiment")
-    parser.add_argument("--demo", action="store_true", help="Run quick demo")
-    parser.add_argument("--model", type=str, default=None, help="Model to use")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
+
+    parser = argparse.ArgumentParser(description="Run coefficient sweep experiment for steered activation inversion")
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
+                        help="Model to use (default: meta-llama/Llama-3.2-1B-Instruct)")
+    parser.add_argument("--device", type=str, default="cuda:1", help="Device to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--lr", type=float, default=1.0, help="Learning rate for inversion")
     parser.add_argument("--direction", type=str, default=None, help="Path to direction.pt")
     parser.add_argument("--method", type=str, default="actadd", help="Steering method: actadd or ablation")
-    parser.add_argument("--invert-original", action="store_true", help="Invert the original prompt")
-    parser.add_argument("--invert-steered", action="store_true", help="Invert the steered prompt")
-    parser.add_argument("--coeff", type=float, default=2.0, help="Steering coefficient")
-    parser.add_argument("--no-chat-template", action="store_true", 
+    parser.add_argument("--coefficients", type=str, default="0.01,0.1,0.25,0.5,1,2.5,5",
+                        help="Comma-separated list of coefficients to test")
+    parser.add_argument("--no-chat-template", action="store_true",
                         help="Do not use chat template")
     parser.add_argument("--continue-on-failure", action="store_true",
                         help="Continue with ground truth when inversion fails")
     parser.add_argument("--top-k", type=int, default=10, help="Number of top candidates to track")
     parser.add_argument("--add-special-tokens", action="store_true",
                         help="Add special tokens (like BOS token for Llama)")
-    parser.add_argument("--steering-type", type=str, default="persona", help="Steering type: refusal or persona")
+    parser.add_argument("--steering-type", type=str, default="refusal", help="Steering type: refusal or persona")
     parser.add_argument("--batch-size", type=int, default=1024, help="Candidate batch size for baseline search")
     parser.add_argument("--n-gpus", type=int, default=1, help="Number of GPUs to use for batched evaluation")
     parser.add_argument("--shuffle-candidates", action="store_true",
@@ -506,22 +517,22 @@ if __name__ == "__main__":
                         help="Maximum iterations for CMA-ES")
     parser.add_argument("--cmaes-stdev-init", type=float, default=1.0,
                         help="Initial standard deviation for CMA-ES")
+
     args = parser.parse_args()
-    
+
+    # Parse coefficients
+    coefficients = [float(x.strip()) for x in args.coefficients.split(",")]
+
     config = Config()
-    config.invert_original = args.invert_original
-    config.invert_steered = args.invert_steered
     config.linear = args.linear
     config.steering_type = args.steering_type
-    if args.model:
-        config.model_id = args.model
+    config.model_id = args.model
     config.device = args.device
     config.seed = args.seed
     config.learning_rate = args.lr
     if args.direction:
         config.direction_path = args.direction
     config.steering_method = args.method
-    config.steering_coeff = args.coeff
     config.use_chat_template = not args.no_chat_template
     config.add_special_tokens = args.add_special_tokens
     config.continue_on_failure = args.continue_on_failure
@@ -532,11 +543,8 @@ if __name__ == "__main__":
     config.cmaes = args.cmaes
     config.cmaes_max_iterations = args.cmaes_max_iterations
     config.cmaes_stdev_init = args.cmaes_stdev_init
-    
+
     # Re-compute special tokens after setting use_chat_template
     config.special_start_tokens = config._get_default_special_tokens()
-    
-    if args.demo:
-        demo(config)
-    else:
-        run_experiment(config)
+
+    run_coeff_sweep_experiment(config, coefficients)
