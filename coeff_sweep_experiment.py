@@ -259,7 +259,7 @@ def run_coeff_sweep_experiment(
     direction, layer, metadata = load_steering_direction(direction_path, config.device)
     print(f"Loaded direction from: {direction_path}")
     print(f"Steering layer: {layer}")
-    print(".4f")
+    print(f"Direction norm: {direction.norm().item():.4f}")
     print(f"Metadata: {metadata}")
 
     base_steering_config = SteeringConfig(
@@ -291,8 +291,64 @@ def run_coeff_sweep_experiment(
         print(f"RUNNING EXPERIMENTS FOR COEFFICIENT: {coeff}")
         print(f"{'*'*60}")
 
+        coeff_results_path = os.path.join(
+            model_output_dir,
+            f"steering_invert_results_{config.steering_type}_{config.steering_method}_coeff_{coeff}.json"
+        )
+        activations_path = os.path.join(
+            model_output_dir,
+            f"steering_activations_{config.steering_type}_{config.steering_method}_coeff_{coeff}.pkl"
+        )
+
+        # Load existing results for this coefficient (resume)
+        existing_by_instr = {}
+        act_by_instr = {}
+        if os.path.exists(coeff_results_path):
+            with open(coeff_results_path, 'r') as f:
+                existing_results = json.load(f)
+            existing_by_instr = {r["instruction"]: r for r in existing_results}
+        if os.path.exists(activations_path):
+            with open(activations_path, 'rb') as f:
+                activations_data_loaded = pickle.load(f)
+            act_by_instr = {item["instruction"]: item for item in activations_data_loaded.get("results", [])}
+        processed = {instr for instr in existing_by_instr if instr in act_by_instr}
+        if processed:
+            print(f"Resuming coeff {coeff}: {len(processed)} instructions already done, {len(instructions) - len(processed)} to run.")
+
+        def save_coeff_results(results_list):
+            results_for_json = []
+            activations_data = {
+                "coefficient": coeff,
+                "steering_layer": layer,
+                "inversion_layer": layer + 1,
+                "results": []
+            }
+            for result in results_list:
+                result_copy = result.copy()
+                baseline_acts = result_copy.pop("baseline_activations", None)
+                steered_acts = result_copy.pop("steered_activations", None)
+                if baseline_acts is not None and steered_acts is not None:
+                    activations_data["results"].append({
+                        "instruction": result["instruction"],
+                        "baseline_activations": baseline_acts,
+                        "steered_activations": steered_acts,
+                        "original_ids": result.get("original_ids"),
+                        "seq_len": result.get("seq_len")
+                    })
+                results_for_json.append(result_copy)
+            with open(coeff_results_path, 'w') as f:
+                json.dump(results_for_json, f, indent=2, default=str)
+            with open(activations_path, 'wb') as f:
+                pickle.dump(activations_data, f)
+
         results = []
         for instruction in instructions:
+            if instruction in processed:
+                r = existing_by_instr[instruction].copy()
+                r["baseline_activations"] = act_by_instr[instruction]["baseline_activations"]
+                r["steered_activations"] = act_by_instr[instruction]["steered_activations"]
+                results.append(r)
+                continue
             try:
                 result = run_single_experiment_with_coeff(
                     model, tokenizer, tokenize_fn,
@@ -320,49 +376,7 @@ def run_coeff_sweep_experiment(
                     "steering_coeff": coeff,
                     "error": str(e),
                 })
-
-            # Save intermediate results for this coefficient
-            coeff_results_path = os.path.join(
-                model_output_dir,
-                f"steering_invert_results_{config.steering_type}_{config.steering_method}_coeff_{coeff}.json"
-            )
-
-            # Separate activations from JSON results for storage
-            results_for_json = []
-            activations_data = {
-                "coefficient": coeff,
-                "steering_layer": layer,
-                "inversion_layer": layer + 1,
-                "results": []
-            }
-
-            for result in results:
-                result_copy = result.copy()
-                # Extract activations for separate storage
-                baseline_acts = result_copy.pop("baseline_activations")
-                steered_acts = result_copy.pop("steered_activations")
-
-                activations_data["results"].append({
-                    "instruction": result["instruction"],
-                    "baseline_activations": baseline_acts,
-                    "steered_activations": steered_acts,
-                    "original_ids": result["original_ids"],
-                    "seq_len": result["seq_len"]
-                })
-
-                results_for_json.append(result_copy)
-
-            # Save JSON results (without large tensors)
-            with open(coeff_results_path, 'w') as f:
-                json.dump(results_for_json, f, indent=2, default=str)
-
-            # Save activations separately
-            activations_path = os.path.join(
-                model_output_dir,
-                f"steering_activations_{config.steering_type}_{config.steering_method}_coeff_{coeff}.pkl"
-            )
-            with open(activations_path, 'wb') as f:
-                pickle.dump(activations_data, f)
+            save_coeff_results(results)
 
         all_results[str(coeff)] = results
 
@@ -409,6 +423,16 @@ def run_coeff_sweep_experiment(
     with open(baseline_path, 'wb') as f:
         pickle.dump(baseline_activations_data, f)
 
+    # Strip activations for JSON (keep comprehensive results serializable)
+    all_results_for_json = {}
+    for k, result_list in all_results.items():
+        all_results_for_json[k] = []
+        for r in result_list:
+            r_copy = r.copy()
+            r_copy.pop("baseline_activations", None)
+            r_copy.pop("steered_activations", None)
+            all_results_for_json[k].append(r_copy)
+
     comprehensive_results = {
         "experiment_metadata": {
             "model_id": config.model_id,
@@ -419,7 +443,7 @@ def run_coeff_sweep_experiment(
             "instructions_tested": instructions,
             "timestamp": datetime.now().isoformat(),
         },
-        "results": all_results
+        "results": all_results_for_json
     }
 
     comprehensive_path = os.path.join(
@@ -464,12 +488,10 @@ def run_coeff_sweep_experiment(
         print(f"Coefficient {coeff}:")
         print(f"  Matches: {stats['steered_matches_original']}/{stats['total_experiments']}")
         print(f"  Failures: {stats['steered_with_failures']}/{stats['total_experiments']}")
-        print(".4f")
-        print(".4f")
         if "avg_mse_to_target" in stats:
-            print(".4f")
+            print(f" Avg MSE to target: {stats['avg_mse_to_target']:.4f}")
         if "avg_mse_to_baseline" in stats:
-            print(".4f")
+            print(f" Avg MSE to baseline: {stats['avg_mse_to_baseline']:.4f}")
         print()
 
     summary_path = os.path.join(
@@ -491,12 +513,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run coefficient sweep experiment for steered activation inversion")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
                         help="Model to use (default: meta-llama/Llama-3.2-1B-Instruct)")
-    parser.add_argument("--device", type=str, default="cuda:1", help="Device to use")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--lr", type=float, default=1.0, help="Learning rate for inversion")
     parser.add_argument("--direction", type=str, default=None, help="Path to direction.pt")
     parser.add_argument("--method", type=str, default="actadd", help="Steering method: actadd or ablation")
-    parser.add_argument("--coefficients", type=str, default="0.01,0.1,0.25,0.5,1,2.5,5",
+    parser.add_argument("--coefficients", type=str, default="-0.1,-0.5,-1.0,-2.5,-5",
                         help="Comma-separated list of coefficients to test")
     parser.add_argument("--no-chat-template", action="store_true",
                         help="Do not use chat template")

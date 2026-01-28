@@ -322,6 +322,15 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
     print("\n" + "="*60)
     print("STEP 2: RUNNING INVERSION EXPERIMENTS")
     print("="*60)
+
+    results_path = os.path.join(
+        model_output_dir,
+        f"experiment_results_{config.steering_type}_{config.steering_method}_coeff_{config.steering_coeff}.json"
+    )
+    activations_path = os.path.join(
+        model_output_dir,
+        f"experiment_activations_{config.steering_type}_{config.steering_method}_coeff_{config.steering_coeff}.pkl"
+    )
     
     if instructions is None:
         if config.steering_type == "refusal":
@@ -330,9 +339,56 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
             instructions = EVIL_TEST_INSTRUCTIONS
         else:
             raise ValueError(f"Unknown steering type: {config.steering_type}")
+
+    # Load existing results if present (resume)
+    existing_by_instr = {}
+    act_by_instr = {}
+    if os.path.exists(results_path):
+        with open(results_path, 'r') as f:
+            existing_results = json.load(f)
+        existing_by_instr = {r["instruction"]: r for r in existing_results}
+    if os.path.exists(activations_path):
+        with open(activations_path, 'rb') as f:
+            activations_data_loaded = pickle.load(f)
+        act_by_instr = {item["instruction"]: item for item in activations_data_loaded.get("results", [])}
+    processed = {instr for instr in existing_by_instr if instr in act_by_instr}
+    if processed:
+        print(f"Resuming: {len(processed)} instructions already done, {len(instructions) - len(processed)} to run.")
     
+    def save_results_and_activations(results_list):
+        results_for_json = []
+        activations_data = {
+            "steering_coeff": config.steering_coeff,
+            "steering_layer": layer,
+            "inversion_layer": layer + 1,
+            "results": []
+        }
+        for result in results_list:
+            result_copy = result.copy()
+            baseline_acts = result_copy.pop("baseline_activations", None)
+            steered_acts = result_copy.pop("steered_activations", None)
+            if baseline_acts is not None and steered_acts is not None:
+                activations_data["results"].append({
+                    "instruction": result["instruction"],
+                    "baseline_activations": baseline_acts,
+                    "steered_activations": steered_acts,
+                    "original_ids": result.get("original_ids"),
+                    "seq_len": result.get("seq_len")
+                })
+            results_for_json.append(result_copy)
+        with open(results_path, 'w') as f:
+            json.dump(results_for_json, f, indent=2, default=str)
+        with open(activations_path, 'wb') as f:
+            pickle.dump(activations_data, f)
+
     results = []
     for instruction in instructions:
+        if instruction in processed:
+            r = existing_by_instr[instruction].copy()
+            r["baseline_activations"] = act_by_instr[instruction]["baseline_activations"]
+            r["steered_activations"] = act_by_instr[instruction]["steered_activations"]
+            results.append(r)
+            continue
         try:
             result = run_single_experiment(
                 model, tokenizer, tokenize_fn,
@@ -360,49 +416,7 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
                 "instruction": instruction,
                 "error": str(e),
             })
-        
-        # Save intermediate results
-        results_path = os.path.join(
-            model_output_dir,
-            f"experiment_results_{config.steering_type}_{config.steering_method}_coeff_{config.steering_coeff}.json"
-        )
-
-        # Separate activations from JSON results for storage
-        results_for_json = []
-        activations_data = {
-            "steering_coeff": config.steering_coeff,
-            "steering_layer": layer,
-            "inversion_layer": layer + 1,
-            "results": []
-        }
-
-        for result in results:
-            result_copy = result.copy()
-            # Extract activations for separate storage
-            baseline_acts = result_copy.pop("baseline_activations")
-            steered_acts = result_copy.pop("steered_activations")
-
-            activations_data["results"].append({
-                "instruction": result["instruction"],
-                "baseline_activations": baseline_acts,
-                "steered_activations": steered_acts,
-                "original_ids": result["original_ids"],
-                "seq_len": result["seq_len"]
-            })
-
-            results_for_json.append(result_copy)
-
-        # Save JSON results (without large tensors)
-        with open(results_path, 'w') as f:
-            json.dump(results_for_json, f, indent=2, default=str)
-
-        # Save activations separately
-        activations_path = os.path.join(
-            model_output_dir,
-            f"experiment_activations_{config.steering_type}_{config.steering_method}_coeff_{config.steering_coeff}.pkl"
-        )
-        with open(activations_path, 'wb') as f:
-            pickle.dump(activations_data, f)
+        save_results_and_activations(results)
     
     # Summary
     print("\n" + "="*60)
@@ -479,14 +493,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run steered activation inversion experiment")
     parser.add_argument("--demo", action="store_true", help="Run quick demo")
     parser.add_argument("--model", type=str, default=None, help="Model to use")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
+    parser.add_argument("--device", type=str, default="cuda:2", help="Device to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--lr", type=float, default=1.0, help="Learning rate for inversion")
     parser.add_argument("--direction", type=str, default=None, help="Path to direction.pt")
     parser.add_argument("--method", type=str, default="actadd", help="Steering method: actadd or ablation")
     parser.add_argument("--invert-original", action="store_true", help="Invert the original prompt")
     parser.add_argument("--invert-steered", action="store_true", help="Invert the steered prompt")
-    parser.add_argument("--coeff", type=float, default=2.0, help="Steering coefficient")
+    parser.add_argument("--coeff", type=float, default=1.0, help="Steering coefficient")
     parser.add_argument("--no-chat-template", action="store_true", 
                         help="Do not use chat template")
     parser.add_argument("--continue-on-failure", action="store_true",
