@@ -803,7 +803,7 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
         json.dump(results, f, indent=2, default=str)
     print(f"Recomputed results saved to: {recomputed_json_path}")
     
-    alignment_label = "Cosine Alignment" if metric == "cosine" else "L2 Distance (lower = more aligned)"
+    alignment_label = "Cosine Similarity" if metric == "cosine" else "L2 Distance"
     
     # Filter out error results for plotting
     valid_results = [r for r in results if "error" not in r]
@@ -903,10 +903,12 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
                 axes1[2, col_idx].set_visible(False)
                 axes1[3, col_idx].set_visible(False)
         
-        fig1.suptitle(f"Per-Token Alignment: {title_suffix} ({metric})", fontsize=14)
+        # fig1.suptitle(f"Per-Token Alignment: {title_suffix} ({metric})", fontsize=14)
+        suffix = "Similarity" if metric == "cosine" else "Distance"
+        fig1.suptitle(f"Per-Token {suffix}", fontsize=14)
         fig1.tight_layout()
         
-        plot1_path = os.path.join(output_dir, f"per_token_alignment_{metric}_{token_mode}_{smooth_mode}.png")
+        plot1_path = os.path.join(output_dir, f"per_token_alignment_{metric}_{token_mode}_{smooth_mode}.pdf")
         fig1.savefig(plot1_path, dpi=150, bbox_inches='tight')
         plt.close(fig1)
         print(f"Per-token plot saved to: {plot1_path}")
@@ -917,7 +919,7 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
     for result in valid_results:
         if "alignment_per_token_no_prefix" in result:
             max_tokens = max(max_tokens, len(result["alignment_per_token_no_prefix"]))
-    
+
     if max_tokens > 0:
         # Collect all N values
         n_values_set = {0}
@@ -926,18 +928,32 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
                 for n_demos in result["manyshot_results"].keys():
                     n_values_set.add(int(n_demos))
         n_values_sorted = sorted(n_values_set)
-        
+
+        # Color setup: N=0 is black, others follow viridis colormap (skipping 0)
+        import matplotlib as mpl
+        viridis = plt.cm.get_cmap("viridis", max(len(n_values_sorted)-1, 1))
+        line_colors = []
+        for n in n_values_sorted:
+            if n == 0:
+                line_colors.append("black")
+            else:
+                color_idx = n_values_sorted.index(n) - 1 if 0 in n_values_sorted else n_values_sorted.index(n)
+                # Use evenly distributed positions, like image reference
+                if len(n_values_sorted) > 1:
+                    mapped_idx = color_idx / (len(n_values_sorted) - 2) if (len(n_values_sorted) > 2) else 0
+                    line_colors.append(viridis(mapped_idx))
+                else:
+                    line_colors.append(viridis(0))
+
         # Create average plots (4 variants)
         for token_mode, smooth_mode, title_suffix in plot_variants:
-            fig_avg, ax_avg = plt.subplots(figsize=(14, 6))
+            fig_avg, ax_avg = plt.subplots(figsize=(8, 4))
             start_idx = 1 if token_mode == "skip_first" else 0
-            
-            colors = plt.cm.tab10(np.linspace(0, 1, len(n_values_sorted)))
-            
+
             for color_idx, n in enumerate(n_values_sorted):
                 token_sums = np.zeros(max_tokens)
                 token_counts = np.zeros(max_tokens)
-                
+
                 for result in valid_results:
                     if n == 0:
                         if "alignment_per_token_no_prefix" in result:
@@ -951,10 +967,10 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
                                 align = np.array(align)
                                 token_sums[:len(align)] += align
                                 token_counts[:len(align)] += 1
-                
+
                 with np.errstate(invalid='ignore'):
                     avg_alignment = np.where(token_counts > 0, token_sums / token_counts, np.nan)
-                
+
                 # Apply token mode and smoothing
                 if token_mode == "skip_first" and len(avg_alignment) > 1:
                     avg_alignment = avg_alignment[start_idx:]
@@ -970,28 +986,49 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
                             avg_alignment[valid_mask]
                         )
                         avg_alignment = smooth_signal(filled, window_size=7)
-                
+
                 token_positions = np.arange(len(avg_alignment))
-                ax_avg.plot(token_positions, avg_alignment, label=f"N={n}",
-                           color=colors[color_idx], alpha=0.8, linewidth=2)
-            
+                # Assign color: N=0 -> black, others by viridis
+                ax_avg.plot(
+                    token_positions,
+                    avg_alignment,
+                    label=f"N={n}",
+                    color=line_colors[color_idx],
+                    alpha=0.95 if n == 0 else 0.8,
+                    linewidth=2.5 if n == 0 else 2,
+                    zorder=3 if n == 0 else 2
+                )
+
             # Add average instruction length marker
             avg_instr_len = np.mean([r.get("instruction_seq_len", 0) for r in valid_results])
             vline_pos = avg_instr_len - start_idx if token_mode == "skip_first" else avg_instr_len
-            ax_avg.axvline(x=vline_pos, color='red', linestyle='--', alpha=0.7, 
-                          label=f'Avg response start (~{int(avg_instr_len)})')
-            
-            ax_avg.set_xlabel("Token Position", fontsize=12)
-            ax_avg.set_ylabel(f"Average {alignment_label}", fontsize=12)
-            ax_avg.set_title(f"Average Per-Token Alignment Across All Instructions: {title_suffix} ({metric})", fontsize=14)
-            ax_avg.legend(loc='best', fontsize=9)
+            ax_avg.axvline(x=vline_pos, color='red', linestyle='--', alpha=0.9, label=f'Instr ends (~{int(avg_instr_len)})')
+
+            ax_avg.set_xlabel("Token Position", fontsize=17)
+            ax_avg.set_ylabel(f"{alignment_label}", fontsize=17)
+            suffix = "Similarity" if metric == "cosine" else "Distance"
+            ax_avg.set_title(f"Average Per-Token {suffix} Across All Instructions", fontsize=19)
+            # ax_avg.legend(loc='right', fontsize=12)
+            ax_avg.tick_params(axis='x', labelsize=16)
+            ax_avg.tick_params(axis='y', labelsize=16)
             ax_avg.grid(True, alpha=0.3)
-            
+
+            # Build legend: reverse order so largest N appears at the top
+            handles, labels = ax_avg.get_legend_handles_labels()
+            ax_avg.legend(
+                handles[::-1],            # flip order of entries
+                labels[::-1],
+                loc="upper right",        # anchor legend on the right side
+                # bbox_to_anchor=(1.02, 0.5),
+                fontsize=12,
+                framealpha=0.5,           # lighter, more transparent background
+                facecolor="white",        # light legend background
+            )
+
             # Set reasonable y-axis limits based on data
             all_values = []
             for line in ax_avg.get_lines():
                 ydata = line.get_ydata()
-                # valid_y = ydata[~np.isnan(ydata)]
                 valid_y = ydata
                 if len(valid_y) > 0:
                     all_values.extend(valid_y)
@@ -999,9 +1036,9 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
                 ymin, ymax = np.percentile(all_values, [2, 98])
                 margin = (ymax - ymin) * 0.1
                 ax_avg.set_ylim(ymin - margin, ymax + margin)
-            
+
             fig_avg.tight_layout()
-            avg_plot_path = os.path.join(output_dir, f"avg_per_token_alignment_{metric}_{token_mode}_{smooth_mode}.png")
+            avg_plot_path = os.path.join(output_dir, f"avg_per_token_alignment_{metric}_{token_mode}_{smooth_mode}.pdf")
             fig_avg.savefig(avg_plot_path, dpi=150, bbox_inches='tight')
             plt.close(fig_avg)
             print(f"Average per-token plot saved to: {avg_plot_path}")
@@ -1117,7 +1154,7 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
                 asr_stds.append(0)
         
         # Create figure with secondary y-axis for ASR
-        fig2, ax2 = plt.subplots(figsize=(12, 6))
+        fig2, ax2 = plt.subplots(figsize=(8, 5))
         ax2_right = ax2.twinx()
         
         # Plot alignment metrics on left axis
@@ -1138,24 +1175,30 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
         
         # title_suffix = "Skip First Token" if token_mode == "skip_first" else "All Tokens"
         title_suffix = ""
-        ax2.set_xlabel("Number of ICL Demonstrations (N)", fontsize=12)
-        ax2.set_ylabel(f"Mean {alignment_label}", fontsize=12, color='black')
-        ax2_right.set_ylabel("Attack Success Rate (%)", fontsize=12, color='tab:red')
-        ax2_right.tick_params(axis='y', labelcolor='tab:red')
+        ax2.set_xlabel("Number of ICL Demonstrations (N)", fontsize=16)
+        ax2.set_ylabel(f"Average {alignment_label}", fontsize=16, color='black')
+        ax2_right.set_ylabel("Attack Success Rate (%)", fontsize=16, color='tab:red')
+        ax2_right.tick_params(axis='y', labelcolor='tab:red', labelsize=14)
         ax2_right.set_ylim(-5, 105)  # ASR is 0-100%
-        
-        ax2.set_title(f"Activation Alignment & Attack Success Rate vs. N", fontsize=14)
+
+        # ax2.set_title(f"Activation Alignment & Attack Success Rate vs. N", fontsize=14)
+        suffix = "Similarity" if metric == "cosine" else "Distance"
+        ax2.set_title(f"{suffix} & Attack Success Rate vs. N", fontsize=19)
         ax2.set_xscale('symlog', base=2)
         ax2.set_xticks([0] + [2 ** i for i in range(7)])  # 2^0 to 2^6
         ax2.set_xlim(left=-0.5)
         ax2.grid(True, alpha=0.3)
-        
+
+        # Set ticks font size
+        ax2.tick_params(axis='x', labelsize=14)
+        ax2.tick_params(axis='y', labelsize=14)
+
         # Combine legends from both axes
         lines = [l1, l2, l3, l4]
         labels = [l.get_label() for l in lines]
-        ax2.legend(lines, labels, fontsize=10)
+        ax2.legend(lines, labels, fontsize=15, loc="upper left")
         
-        plot2_path = os.path.join(output_dir, f"alignment_vs_n_demos_{metric}_{token_mode}.png")
+        plot2_path = os.path.join(output_dir, f"alignment_vs_n_demos_{metric}_{token_mode}.pdf")
         fig2.savefig(plot2_path, dpi=150, bbox_inches='tight')
         plt.close(fig2)
         print(f"Alignment vs N plot saved to: {plot2_path}")
@@ -1223,12 +1266,14 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
             ax3.set_ylabel("Number of Demonstrations (N)", fontsize=12)
             ax3.set_yticks(range(len(n_list)))
             ax3.set_yticklabels(n_list)
-            title_suffix = "Skip First Token" if token_mode == "skip_first" else "All Tokens"
-            ax3.set_title(f"Activation Alignment Heatmap ({title_suffix})", fontsize=14)
+            # title_suffix = "Skip First Token" if token_mode == "skip_first" else "All Tokens"
+            # ax3.set_title(f"Activation Alignment Heatmap ({title_suffix})", fontsize=14)
+            suffix = "Similarity" if metric == "cosine" else "Distance"
+            ax3.set_title(f"Activation {suffix} Heatmap", fontsize=14)
             cbar = plt.colorbar(im, ax=ax3, label=alignment_label)
             cbar.ax.set_ylabel(f"{alignment_label}\n(range: {vmin:.3f} to {vmax:.3f})", fontsize=10)
             
-            plot3_path = os.path.join(output_dir, f"alignment_heatmap_{metric}_{token_mode}.png")
+            plot3_path = os.path.join(output_dir, f"alignment_heatmap_{metric}_{token_mode}.pdf")
             fig3.savefig(plot3_path, dpi=150, bbox_inches='tight')
             plt.close(fig3)
             print(f"Heatmap saved to: {plot3_path}")
@@ -1247,7 +1292,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Run many-shot activation alignment experiment")
-    parser.add_argument("--model", type=str, default='google/gemma-3-1b-it', help="Model to use")
+    parser.add_argument("--model", type=str, default='meta-llama/Llama-3.2-1B-Instruct', help="Model to use")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--coeff", type=float, default=-1.0, help="Steering coefficient")
@@ -1262,7 +1307,7 @@ if __name__ == "__main__":
                         help="Maximum number of demonstrations to load")
     parser.add_argument("--max-new-tokens", type=int, default=512,
                         help="Maximum new tokens for generation")
-    parser.add_argument("--analyze", type=str, default="/src/new_cont/llms/steercheck/invertsteer/outputs/gemma-3-1b-it/manyshot/manyshot_results_refusal_actadd_coeff_-1.0.json",
+    parser.add_argument("--analyze", type=str, default="/src/new_cont/llms/steercheck/invertsteer/outputs/Llama-3.2-1B-Instruct/manyshot/manyshot_results_refusal_actadd_coeff_-1.0.json",
     # parser.add_argument("--analyze", type=str, default=None,
                         help="Path to results JSON to analyze (skips experiment)")
     args = parser.parse_args()

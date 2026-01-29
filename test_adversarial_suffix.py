@@ -280,14 +280,14 @@ def create_plots(evaluation_baseline: Dict, evaluation_adversarial: Dict, output
 
 def main():
     parser = argparse.ArgumentParser(description='Test adversarial suffix attacks on models')
-    parser.add_argument('--model', type=str, default='google/gemma-3-270m-it', choices=['LiquidAI/LFM2.5-1.2B-Instruct', 'google/gemma-3-270m-it', 'google/gemma-3-1b-it', 'LLM-LAT/robust-llama3-8b-instruct', 'nvidia/Nemotron-Flash-3B-Instruct', 'microsoft/Phi-4-mini-instruct', 'Qwen/Qwen3-4B-Instruct-2507', 'meta-llama/Llama-3.1-8B-Instruct', 'meta-llama/Llama-3.1-8B-Instruct', 'meta-llama/Llama-3.2-1B-Instruct'], help='Model name or path')
+    parser.add_argument('--model', type=str, default='meta-llama/Meta-Llama-3-8B-Instruct', choices=['LiquidAI/LFM2.5-1.2B-Instruct', 'google/gemma-3-270m-it', 'google/gemma-3-1b-it', 'LLM-LAT/robust-llama3-8b-instruct', 'nvidia/Nemotron-Flash-3B-Instruct', 'microsoft/Phi-4-mini-instruct', 'Qwen/Qwen3-4B-Instruct-2507', 'meta-llama/Llama-3.1-8B-Instruct', 'meta-llama/Llama-3.1-8B-Instruct', 'meta-llama/Llama-3.2-1B-Instruct'], help='Model name or path')
     parser.add_argument('--dataset', type=str, 
                        default='/src/new_cont/llms/steercheck/refusal_direction/dataset/splits/harmful_test.json',
                        help='Path to harmful test dataset')
     parser.add_argument('--n_samples', type=int, default=-1, help='Number of prompts to sample. If -1, use all prompts.')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for inference')
     parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum new tokens to generate')
-    parser.add_argument('--device', type=str, default='cuda:3', help='Device to use (cuda/cpu)')
+    parser.add_argument('--device', type=str, default='cuda:0', help='Device to use (cuda/cpu)')
     parser.add_argument('--output_dir', type=str, default='./adversarial_suffix_results', 
                        help='Output directory for results')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')

@@ -513,12 +513,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run coefficient sweep experiment for steered activation inversion")
     parser.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
                         help="Model to use (default: meta-llama/Llama-3.2-1B-Instruct)")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
+    parser.add_argument("--device", type=str, default="cuda:3", help="Device to use")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--lr", type=float, default=1.0, help="Learning rate for inversion")
     parser.add_argument("--direction", type=str, default=None, help="Path to direction.pt")
     parser.add_argument("--method", type=str, default="actadd", help="Steering method: actadd or ablation")
-    parser.add_argument("--coefficients", type=str, default="-0.1,-0.5,-1.0,-2.5,-5",
+    parser.add_argument("--coefficients", type=str, default="1.0",
                         help="Comma-separated list of coefficients to test")
     parser.add_argument("--no-chat-template", action="store_true",
                         help="Do not use chat template")
@@ -527,7 +527,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=10, help="Number of top candidates to track")
     parser.add_argument("--add-special-tokens", action="store_true",
                         help="Add special tokens (like BOS token for Llama)")
-    parser.add_argument("--steering-type", type=str, default="refusal", help="Steering type: refusal or persona")
+    parser.add_argument("--steering-type", type=str, default="persona", help="Steering type: refusal or persona")
     parser.add_argument("--batch-size", type=int, default=1024, help="Candidate batch size for baseline search")
     parser.add_argument("--n-gpus", type=int, default=1, help="Number of GPUs to use for batched evaluation")
     parser.add_argument("--shuffle-candidates", action="store_true",

@@ -17,10 +17,10 @@ class Config:
     # Model configuration
     # model_id: str = "meta-llama/Llama-3.1-8B-Instruct"
     # model_id: str = "meta-llama/Llama-3.2-1B-Instruct"
-    # model_id: str = "google/gemma-3-1b-it"
+    model_id: str = "google/gemma-3-1b-it"
     # model_id: str = "google/gemma-2b-it"
     # model_id: str = "google/gemma-3-270m-it"
-    model_id: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    # model_id: str = "Qwen/Qwen2.5-0.5B-Instruct"
     # model_id: str = "openai-community/gpt2"
     device: str = "cuda"
     dtype: str = "bfloat16"  # Use float32 for gradient computation in SIP-It
