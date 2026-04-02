@@ -666,15 +666,15 @@ def plot_avg_topk_token_distances_with_errorbars(
 
     plt.xlabel("Token position", fontsize=16)
     plt.ylabel("L2 Distance", fontsize=16)
-    # plt.ylim(-0.7, 5)
-    plt.ylim(-50, 1850)
+    plt.ylim(-0.7, 5)
+    # plt.ylim(-50, 1850)
     # plt.title(
     #     f"Average top-{max_k} token L2 distances\n"
     #     f"steering_vector={steering_type}, $\lambda$={steering_coeff}", fontsize=18
     # )
     plt.tick_params(axis='x', labelsize=14)
     plt.tick_params(axis='y', labelsize=14)
-    plt.legend(loc="upper right", fontsize=12)
+    plt.legend(loc="lower left", fontsize=12)
     os.makedirs(f"{model_output_dir}/figs", exist_ok=True)
     plt.savefig(f"{model_output_dir}/figs/avg_topk_token_distances_{steering_type}_{steering_coeff}.pdf", dpi=150, bbox_inches='tight')
     plt.tight_layout()
@@ -1270,4 +1270,4 @@ if __name__ == "__main__":
     
     # results = load_results(args.results_file)
     # print_summary(results)
-    plot_all_for_model(model_id="meta-llama/gemma-3-1b-it", output_dir="outputs/", skip_first_token=True)
+    plot_all_for_model(model_id="meta-llama/Llama-3.2-1B-Instruct", output_dir="outputs/", skip_first_token=True)

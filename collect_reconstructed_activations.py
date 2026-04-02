@@ -231,6 +231,11 @@ def main():
         default="cuda:2",
         help="Device to use (defaults to Config().device).",
     )
+    parser.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="NF4 BitsAndBytes load (GPU + bitsandbytes).",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -238,9 +243,12 @@ def main():
         config.model_id = args.model
     if args.device:
         config.device = args.device
+    config.load_in_4bit = args.load_in_4bit
 
     print(f"Loading model: {config.model_id} on device {config.device}")
-    model, tokenizer = load_model(config.model_id, config.device, config.dtype)
+    model, tokenizer = load_model(
+        config.model_id, config.device, config.dtype, load_in_4bit=config.load_in_4bit
+    )
     tokenize_fn = get_tokenize_fn(
         tokenizer,
         use_chat_template=config.use_chat_template,

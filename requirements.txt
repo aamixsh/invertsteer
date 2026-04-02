@@ -1,6 +1,7 @@
 torch>=2.0.0
 transformers>=4.40.0
 accelerate>=0.31.0
+bitsandbytes>=0.43.1
 safetensors
 tokenizers
 huggingface-hub
@@ -17,3 +18,6 @@ openai
 python-dotenv
 ipython
 jupyter
+dspy
+gepa
+peft

@@ -26,6 +26,8 @@ from pipeline.utils.hook_utils import (
     get_all_direction_ablation_hooks,
 )
 
+from model_utils import get_input_device
+
 
 @dataclass
 class SteeringConfig:
@@ -60,17 +62,22 @@ def load_steering_direction(direction_path: str, device: str = "cuda") -> Tuple[
     """
     import json
     
-    direction = torch.load(direction_path, map_location=device)
+    # torch.load does not understand map_location="auto" (used for sharded models).
+    # In that case we load onto CPU first and let the caller move it as needed.
+    map_location = device
+    if map_location == "auto":
+        map_location = "cpu"
+    direction = torch.load(direction_path, map_location=map_location)
     
     # Handle different save formats
     if isinstance(direction, dict):
         # Old format from our implementation
-        dir_tensor = direction['direction'].to(device)
+        dir_tensor = direction['direction'].to(map_location)
         layer = direction.get('layer', -1)
         metadata = direction.get('config', {})
     else:
         # New format from refusal_direction pipeline (just the tensor)
-        dir_tensor = direction.to(device)
+        dir_tensor = direction.to(map_location)
         layer = -1
         metadata = {}
 
@@ -130,7 +137,14 @@ def get_steering_hooks(
         # Also ablate from attention and MLP outputs
         fwd_hooks = []
         for l in range(n_layers):
-            fwd_hooks.append((model_layers[l].self_attn, get_direction_ablation_output_hook(direction=direction)))
+            # Qwen3.5 MoE has hybrid attention: some layers expose `self_attn`, others `linear_attn`.
+            if hasattr(model_layers[l], "self_attn"):
+                attn_mod = model_layers[l].self_attn
+            elif hasattr(model_layers[l], "linear_attn"):
+                attn_mod = model_layers[l].linear_attn
+            else:
+                raise ValueError(f"Layer {l} has no self_attn/linear_attn module; cannot ablate attention output.")
+            fwd_hooks.append((attn_mod, get_direction_ablation_output_hook(direction=direction)))
             fwd_hooks.append((model_layers[l].mlp, get_direction_ablation_output_hook(direction=direction)))
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -186,6 +200,7 @@ def generate_with_steering(
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
         )
+
     
     # Remove prompt tokens
     generated_tokens = outputs[:, input_ids.size(1):]
@@ -292,8 +307,9 @@ def compare_generations(
     """
     # Tokenize
     inputs = tokenize_fn(instructions=instructions)
-    input_ids = inputs.input_ids.to(model.device)
-    attention_mask = inputs.attention_mask.to(model.device)
+    input_device = get_input_device(model)
+    input_ids = inputs.input_ids.to(input_device)
+    attention_mask = inputs.attention_mask.to(input_device)
 
     # Baseline generation (no steering)
     with torch.no_grad():

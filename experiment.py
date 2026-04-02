@@ -19,7 +19,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 from config import Config, TEST_INSTRUCTIONS, EVIL_TEST_INSTRUCTIONS
-from model_utils import load_model, get_tokenize_fn, set_seed, get_num_layers
+from model_utils import load_model, get_tokenize_fn, set_seed, get_num_layers, get_input_device
 from steering import (
     SteeringConfig,
     load_steering_direction,
@@ -33,6 +33,26 @@ from inversion import (
     compute_activation_mse,
     print_top_k_tokens,
 )
+
+
+def _linear_inversion_batch_size(
+    model, batch_size: int, n_gpus: Optional[int], linear: bool
+) -> int:
+    """Cap discrete linear inversion batch size; default 1024 OOMs on large MoE + sharded loads."""
+    return 1024
+    if not linear:
+        return batch_size
+    env = os.environ.get("INVERTSTEER_INVERSION_BATCH_SIZE")
+    if env:
+        return max(1, min(batch_size, int(env)))
+    inv = batch_size
+    if n_gpus is not None and n_gpus > 1:
+        inv = min(inv, max(1, batch_size // (n_gpus * 8)))
+    cfg = getattr(model, "config", None)
+    vocab = getattr(cfg, "vocab_size", 0) if cfg is not None else 0
+    if vocab > 100_000 or getattr(model, "hf_device_map", None):
+        inv = min(inv, 32)
+    return max(1, inv)
 
 
 def run_single_experiment(
@@ -96,8 +116,9 @@ def run_single_experiment(
     
     # Tokenize the instruction
     inputs = tokenize_fn(instructions=[instruction])
-    input_ids = inputs.input_ids.to(model.device)
-    attention_mask = inputs.attention_mask.to(model.device)
+    input_device = get_input_device(model)
+    input_ids = inputs.input_ids.to(input_device)
+    attention_mask = inputs.attention_mask.to(input_device)
 
     seq_len = input_ids.size(1)
     result["seq_len"] = seq_len
@@ -150,7 +171,11 @@ def run_single_experiment(
     if invert_original:
         # Step 3: Baseline inversion
         print("\n[Step 3] Inverting baseline activations...")
-        
+        use_linear = linear and not cmaes
+        inv_batch_size = _linear_inversion_batch_size(
+            model, batch_size, n_gpus, use_linear
+        )
+
         baseline_match, baseline_time, baseline_recon_ids, baseline_times, baseline_inv_result = inversion_attack(
             input_ids, model, tokenizer, inversion_layer, lr, seed,
             linear=linear if not cmaes else False,
@@ -158,7 +183,7 @@ def run_single_experiment(
             special_start_tokens=special_start_tokens,
             continue_on_failure=continue_on_failure,
             top_k=top_k,
-            batch_size=batch_size,
+            batch_size=inv_batch_size,
             n_gpus=n_gpus,
             shuffle_candidates=shuffle_candidates,
             cmaes_max_iterations=cmaes_max_iterations,
@@ -183,7 +208,7 @@ def run_single_experiment(
             baseline_recon_text = tokenizer.decode(baseline_recon_ids)
             result["baseline_inversion"]["reconstructed_text"] = baseline_recon_text
             
-            recon_ids_tensor = torch.tensor(baseline_recon_ids).unsqueeze(0).to(model.device)
+            recon_ids_tensor = torch.tensor(baseline_recon_ids).unsqueeze(0).to(get_input_device(model))
             baseline_mse = compute_activation_mse(
                 model, recon_ids_tensor, baseline_acts, inversion_layer
             )
@@ -195,13 +220,14 @@ def run_single_experiment(
     
     # Step 4: Steered inversion
     print("\n[Step 4] Inverting steered activations...")
-    
+    inv_batch_size = _linear_inversion_batch_size(model, batch_size, n_gpus, linear=True)
+
     steered_match, steered_time, steered_recon_ids, steered_times, steered_inv_result = inversion_attack_with_target(
         steered_acts, model, tokenizer, inversion_layer, lr, seed, 
         verbose=True, original_ids=input_ids, linear=True, cmaes=False,
         special_start_tokens=special_start_tokens,
         continue_on_failure=continue_on_failure,
-        top_k=top_k, batch_size=batch_size, n_gpus=n_gpus, shuffle_candidates=shuffle_candidates,
+        top_k=top_k, batch_size=inv_batch_size, n_gpus=n_gpus, shuffle_candidates=shuffle_candidates,
         cmaes_max_iterations=cmaes_max_iterations,
         cmaes_stdev_init=cmaes_stdev_init,
     )
@@ -224,7 +250,7 @@ def run_single_experiment(
         steered_recon_text = tokenizer.decode(steered_recon_ids)
         result["steered_inversion"]["reconstructed_text"] = steered_recon_text
         
-        recon_ids_tensor = torch.tensor(steered_recon_ids).unsqueeze(0).to(model.device)
+        recon_ids_tensor = torch.tensor(steered_recon_ids).unsqueeze(0).to(get_input_device(model))
         steered_mse = compute_activation_mse(
             model, recon_ids_tensor, steered_acts, inversion_layer
         )
@@ -239,8 +265,8 @@ def run_single_experiment(
         print("\n[Step 5] Testing reconstructed prompt...")
         
         recon_inputs = tokenize_fn(instructions=[steered_recon_text])
-        recon_input_ids = recon_inputs.input_ids.to(model.device)
-        recon_attention_mask = recon_inputs.attention_mask.to(model.device)
+        recon_input_ids = recon_inputs.input_ids.to(get_input_device(model))
+        recon_attention_mask = recon_inputs.attention_mask.to(get_input_device(model))
         
         with torch.no_grad():
             recon_outputs = model.generate(
@@ -277,9 +303,13 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
     os.makedirs(model_output_dir, exist_ok=True)
     print(f"Results will be saved to: {model_output_dir}")
 
+    print(f"config.device: {config.device}")
+
     # Load model
     print(f"\nLoading model: {config.model_id}")
-    model, tokenizer = load_model(config.model_id, config.device, config.dtype)
+    model, tokenizer = load_model(
+        config.model_id, config.device, config.dtype, load_in_4bit=config.load_in_4bit
+    )
     tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
 
     # print(model)
@@ -305,6 +335,8 @@ def run_experiment(config: Config, instructions: Optional[List[str]] = None):
         )
 
     direction, layer, metadata = load_steering_direction(direction_path, config.device)
+    # Ensure direction is on the same device as model inputs / residual stream.
+    direction = direction.to(get_input_device(model))
     print(f"Loaded direction from: {direction_path}")
     print(f"Steering layer: {layer}")
     print(f"Direction norm: {direction.norm().item():.4f}")
@@ -450,7 +482,9 @@ def demo(config: Config):
     set_seed(config.seed)
     
     print(f"\nLoading model: {config.model_id}")
-    model, tokenizer = load_model(config.model_id, config.device, config.dtype)
+    model, tokenizer = load_model(
+        config.model_id, config.device, config.dtype, load_in_4bit=config.load_in_4bit
+    )
     tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
     
     direction_path = config.get_direction_path()
@@ -493,14 +527,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run steered activation inversion experiment")
     parser.add_argument("--demo", action="store_true", help="Run quick demo")
     parser.add_argument("--model", type=str, default=None, help="Model to use")
-    parser.add_argument("--device", type=str, default="cuda:2", help="Device to use")
+    parser.add_argument("--device", type=str, default="auto", help="Device to use")
+    parser.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="Load model in NF4 via BitsAndBytes (Transformers); needs GPU + bitsandbytes.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--lr", type=float, default=1.0, help="Learning rate for inversion")
     parser.add_argument("--direction", type=str, default=None, help="Path to direction.pt")
     parser.add_argument("--method", type=str, default="actadd", help="Steering method: actadd or ablation")
     parser.add_argument("--invert-original", action="store_true", help="Invert the original prompt")
     parser.add_argument("--invert-steered", action="store_true", help="Invert the steered prompt")
-    parser.add_argument("--coeff", type=float, default=1.0, help="Steering coefficient")
+    parser.add_argument("--coeff", type=float, default=-1.0, help="Steering coefficient")
     parser.add_argument("--no-chat-template", action="store_true", 
                         help="Do not use chat template")
     parser.add_argument("--continue-on-failure", action="store_true",
@@ -508,7 +547,7 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=10, help="Number of top candidates to track")
     parser.add_argument("--add-special-tokens", action="store_true",
                         help="Add special tokens (like BOS token for Llama)")
-    parser.add_argument("--steering-type", type=str, default="persona", help="Steering type: refusal or persona")
+    parser.add_argument("--steering-type", type=str, default="refusal", help="Steering type: refusal or persona")
     parser.add_argument("--batch-size", type=int, default=1024, help="Candidate batch size for baseline search")
     parser.add_argument("--n-gpus", type=int, default=1, help="Number of GPUs to use for batched evaluation")
     parser.add_argument("--shuffle-candidates", action="store_true",
@@ -530,6 +569,7 @@ if __name__ == "__main__":
     if args.model:
         config.model_id = args.model
     config.device = args.device
+    config.load_in_4bit = args.load_in_4bit
     config.seed = args.seed
     config.learning_rate = args.lr
     if args.direction:

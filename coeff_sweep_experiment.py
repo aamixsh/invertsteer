@@ -235,7 +235,9 @@ def run_coeff_sweep_experiment(
 
     # Load model
     print(f"\nLoading model: {config.model_id}")
-    model, tokenizer = load_model(config.model_id, config.device, config.dtype)
+    model, tokenizer = load_model(
+        config.model_id, config.device, config.dtype, load_in_4bit=config.load_in_4bit
+    )
     tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=config.use_chat_template, add_special_tokens=config.add_special_tokens)
 
     n_layers = get_num_layers(model)
@@ -539,6 +541,11 @@ if __name__ == "__main__":
                         help="Maximum iterations for CMA-ES")
     parser.add_argument("--cmaes-stdev-init", type=float, default=1.0,
                         help="Initial standard deviation for CMA-ES")
+    parser.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="NF4 BitsAndBytes load (GPU + bitsandbytes).",
+    )
 
     args = parser.parse_args()
 
@@ -565,6 +572,7 @@ if __name__ == "__main__":
     config.cmaes = args.cmaes
     config.cmaes_max_iterations = args.cmaes_max_iterations
     config.cmaes_stdev_init = args.cmaes_stdev_init
+    config.load_in_4bit = args.load_in_4bit
 
     # Re-compute special tokens after setting use_chat_template
     config.special_start_tokens = config._get_default_special_tokens()

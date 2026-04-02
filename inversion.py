@@ -146,6 +146,10 @@ def _maybe_wrap_data_parallel(model, n_gpus: int):
         return model
     if isinstance(model, torch.nn.DataParallel):
         return model
+    # Models loaded with accelerate device_map="auto" are already sharded across GPUs.
+    # Wrapping them in DataParallel replicates the full module on GPU0 and usually OOMs.
+    if getattr(model, "hf_device_map", None):
+        return model
 
     device = next(model.parameters()).device
     if device.type != "cuda":
@@ -491,25 +495,53 @@ def _score_discrete_candidates(
     layer_idx: int,
     h_target_token: Tensor,
 ) -> Tensor:
-    device = next(model.parameters()).device
-    candidate_ids = candidate_ids.to(device)
+    # IMPORTANT: this function is called repeatedly during token search.
+    # The previous implementation requested `output_hidden_states=True`, which
+    # materializes hidden states for *all* layers and OOMs quickly for large
+    # candidate batches (e.g. 1024 candidates × ~30 tokens × 40 layers).
+    #
+    # Instead, we capture only the output of the targeted decoder layer using a
+    # forward hook, and run the model without `output_hidden_states`.
+    input_device = model.get_input_embeddings().weight.device
+    candidate_ids = candidate_ids.to(input_device)
 
     if discovered_ids:
-        prefix = torch.tensor(discovered_ids, device=device).unsqueeze(0)
+        prefix = torch.tensor(discovered_ids, device=input_device).unsqueeze(0)
         prefix = prefix.expand(candidate_ids.size(0), -1)
         input_ids = torch.cat([prefix, candidate_ids.unsqueeze(1)], dim=1)
     else:
         input_ids = candidate_ids.unsqueeze(1)
 
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+    # hidden_states[layer_idx] corresponds to output after decoder layer (layer_idx - 1)
+    # because hidden_states[0] is the embedding output.
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("Model structure not supported. Expected model.model.layers")
+    decoder_layer = model.model.layers[layer_idx - 1]
 
-    h_pred = outputs.hidden_states[layer_idx][:, -1, :]
-    target = h_target_token.to(device)
+    h_pred = None
+
+    def _hook_fn(module, inp, out):
+        nonlocal h_pred
+        if isinstance(out, tuple):
+            out = out[0]
+        # out: [batch, seq_len, hidden]
+        h_pred = out[:, -1, :]
+
+    handle = decoder_layer.register_forward_hook(_hook_fn)
+    try:
+        with torch.no_grad():
+            _ = model(
+                input_ids=input_ids,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+    finally:
+        handle.remove()
+
+    if h_pred is None:
+        raise RuntimeError("Failed to capture target layer output via hook.")
+
+    target = h_target_token.to(h_pred.device)
     if target.dim() == 1:
         target = target.unsqueeze(0)
     distances = torch.norm(h_pred - target, dim=1)
@@ -529,7 +561,9 @@ def _find_token_linear(
     batch_size: int,
     shuffle_candidates: bool,
 ) -> TokenSearchResult:
-    device = next(model.parameters()).device
+    # For sharded models, ensure candidate batches are created on the input
+    # embedding device (not an arbitrary parameter shard).
+    device = model.get_input_embeddings().weight.device
     num_tokens = embedding_matrix.size(0)
     candidate_ids = torch.arange(num_tokens, device=device)
 

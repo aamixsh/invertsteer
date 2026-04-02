@@ -83,7 +83,7 @@ class ManyShotConfig(Config):
     
     # Maximum number of demonstrations to load
     max_demonstrations: int = 100
-    
+
     def __post_init__(self):
         super().__post_init__()
         if self.icl_demonstrations_path is None:
@@ -91,8 +91,15 @@ class ManyShotConfig(Config):
             self.icl_demonstrations_path = os.path.join(
                 self.refusal_dir_path,
                 "pipeline", "runs", model_alias, "completions",
-                "jailbreakbench_actadd_evaluations.json"
+                "jailbreakbench_ablation_evaluations.json"
             )
+            if not os.path.exists(self.icl_demonstrations_path):
+                model_alias = model_alias.split('/')[-1].lower()
+                self.icl_demonstrations_path = os.path.join(
+                    self.refusal_dir_path,
+                    "pipeline", "runs", model_alias, "completions",
+                    "jailbreakbench_ablation_evaluations.json"
+                )
 
 
 def load_icl_demonstrations(
@@ -459,7 +466,9 @@ def run_manyshot_experiment(config: ManyShotConfig, instructions: Optional[List[
     
     # Load model
     print(f"\nLoading model: {config.model_id}")
-    model, tokenizer = load_model(config.model_id, config.device, config.dtype)
+    model, tokenizer = load_model(
+        config.model_id, config.device, config.dtype, load_in_4bit=config.load_in_4bit
+    )
     tokenizer.pad_token = tokenizer.eos_token
     tokenize_fn = get_tokenize_fn(
         tokenizer,
@@ -471,7 +480,10 @@ def run_manyshot_experiment(config: ManyShotConfig, instructions: Optional[List[
     print("\nLoading steering direction...")
     direction_path = config.get_direction_path()
     if not os.path.exists(direction_path):
-        raise FileNotFoundError(f"Direction file not found: {direction_path}")
+        try:
+            direction_path = config.get_direction_path(model_alias.lower())
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Direction file not found: {direction_path}")
     
     direction, layer, metadata = load_steering_direction(direction_path, config.device)
     print(f"Loaded direction from layer {layer}")
@@ -591,7 +603,7 @@ def _save_results(results: List[Dict], output_dir: str, config: ManyShotConfig):
                 manyshot_json[n_demos] = manyshot_copy
             
             result_copy["manyshot_results"] = manyshot_json
-        
+
         results_for_json.append(result_copy)
         activations_data["results"].append(acts_data)
     
@@ -761,6 +773,234 @@ def smooth_signal(signal: np.ndarray, window_size: int = 5) -> np.ndarray:
     padded = np.pad(signal, (window_size // 2, window_size // 2), mode='edge')
     smoothed = np.convolve(padded, kernel, mode='valid')
     return smoothed[:len(signal)]
+
+
+def _save_manyshot_figure4_two_panel(
+    valid_results: List[Dict[str, Any]],
+    asr_by_n: Dict[int, List[int]],
+    output_dir: str,
+    metric: str,
+    token_mode: str = "all_tokens",
+    smooth_mode: str = "raw",
+) -> None:
+    """
+    Single figure: (left) mean L2/similarity vs N with ASR on twin axis;
+    (right) average per-token curve for each N (matches paper-style Figure 4 layout).
+    """
+    import matplotlib.pyplot as plt
+
+    if not valid_results:
+        return
+
+    alignment_label = "Cosine Similarity" if metric == "cosine" else "L2 Distance"
+    start_idx = 1 if token_mode == "skip_first" else 0
+    suffix = "Similarity" if metric == "cosine" else "Distance"
+
+    # ---- Left panel: aggregate vs N (same logic as alignment_vs_n_demos plot) ----
+    instr_alignment_by_n: Dict[int, List[float]] = {}
+    resp_alignment_by_n: Dict[int, List[float]] = {}
+    overall_alignment_by_n: Dict[int, List[float]] = {}
+
+    for result in valid_results:
+        instruction_seq_len = result.get("instruction_seq_len", 0)
+
+        if "alignment_per_token_no_prefix" in result:
+            alignment = np.array(result["alignment_per_token_no_prefix"])
+            if token_mode == "skip_first" and len(alignment) > 1:
+                alignment = alignment[start_idx:]
+                instr_len = max(0, instruction_seq_len - start_idx)
+            else:
+                instr_len = instruction_seq_len
+
+            if 0 not in instr_alignment_by_n:
+                instr_alignment_by_n[0] = []
+                resp_alignment_by_n[0] = []
+                overall_alignment_by_n[0] = []
+
+            if instr_len > 0 and len(alignment) >= instr_len:
+                instr_alignment_by_n[0].append(float(np.mean(alignment[:instr_len])))
+            if len(alignment) > instr_len:
+                resp_alignment_by_n[0].append(float(np.mean(alignment[instr_len:])))
+            overall_alignment_by_n[0].append(float(np.mean(alignment)))
+
+        if "manyshot_results" in result:
+            for n_demos, manyshot_result in result["manyshot_results"].items():
+                n = int(n_demos)
+                if "alignment_per_token" not in manyshot_result:
+                    continue
+                alignment = np.array(manyshot_result["alignment_per_token"])
+                if token_mode == "skip_first" and len(alignment) > 1:
+                    alignment = alignment[start_idx:]
+                    instr_len = max(0, instruction_seq_len - start_idx)
+                else:
+                    instr_len = instruction_seq_len
+
+                if n not in instr_alignment_by_n:
+                    instr_alignment_by_n[n] = []
+                    resp_alignment_by_n[n] = []
+                    overall_alignment_by_n[n] = []
+
+                if instr_len > 0 and len(alignment) >= instr_len:
+                    instr_alignment_by_n[n].append(float(np.mean(alignment[:instr_len])))
+                if len(alignment) > instr_len:
+                    resp_alignment_by_n[n].append(float(np.mean(alignment[instr_len:])))
+                overall_alignment_by_n[n].append(float(np.mean(alignment)))
+
+    n_values = sorted(overall_alignment_by_n.keys())
+    if not n_values:
+        return
+
+    instr_means = [np.mean(instr_alignment_by_n[n]) if instr_alignment_by_n.get(n) else 0 for n in n_values]
+    instr_stds = [np.std(instr_alignment_by_n[n]) if instr_alignment_by_n.get(n) else 0 for n in n_values]
+    resp_means = [np.mean(resp_alignment_by_n[n]) if resp_alignment_by_n.get(n) else 0 for n in n_values]
+    resp_stds = [np.std(resp_alignment_by_n[n]) if resp_alignment_by_n.get(n) else 0 for n in n_values]
+    overall_means = [np.mean(overall_alignment_by_n[n]) for n in n_values]
+    overall_stds = [np.std(overall_alignment_by_n[n]) for n in n_values]
+
+    asr_means = []
+    for n in n_values:
+        if n in asr_by_n and asr_by_n[n]:
+            asr_means.append(np.mean(asr_by_n[n]) * 100)
+        else:
+            asr_means.append(0.0)
+
+    # ---- Right panel: max token length & N list ----
+    max_tokens = 0
+    for result in valid_results:
+        if "alignment_per_token_no_prefix" in result:
+            max_tokens = max(max_tokens, len(result["alignment_per_token_no_prefix"]))
+    if max_tokens <= 0:
+        fig, ax_left = plt.subplots(1, 1, figsize=(8, 5))
+        ax_right = None
+    else:
+        fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(16, 5))
+
+    ax_left_r = ax_left.twinx()
+    l1 = ax_left.errorbar(
+        n_values, instr_means, yerr=instr_stds,
+        marker="o", capsize=5, capthick=2, linewidth=2, markersize=8,
+        label="Instruction portion", color="tab:blue",
+    )
+    l2 = ax_left.errorbar(
+        n_values, resp_means, yerr=resp_stds,
+        marker="s", capsize=5, capthick=2, linewidth=2, markersize=8,
+        label="Response portion", color="tab:orange",
+    )
+    l3 = ax_left.errorbar(
+        n_values, overall_means, yerr=overall_stds,
+        marker="^", capsize=5, capthick=2, linewidth=2, markersize=8,
+        label="Overall", color="tab:green",
+    )
+    l4 = ax_left_r.errorbar(
+        n_values, asr_means, yerr=0,
+        marker="D", capsize=5, capthick=2, linewidth=2.5, markersize=10,
+        label="Attack Success Rate", color="tab:red", linestyle="--",
+    )
+    ax_left.set_xlabel("Number of ICL Demonstrations (N)", fontsize=16)
+    ax_left.set_ylabel(f"Average {alignment_label}", fontsize=16, color="black")
+    ax_left_r.set_ylabel("Attack Success Rate (%)", fontsize=16, color="tab:red")
+    ax_left_r.tick_params(axis="y", labelcolor="tab:red", labelsize=14)
+    ax_left_r.set_ylim(-5, 105)
+    ax_left.set_title(f"{suffix} & Attack Success Rate vs. N", fontsize=17)
+    ax_left.set_xscale("symlog", base=2)
+    ax_left.set_xticks([0] + [2 ** i for i in range(7)])
+    ax_left.set_xlim(left=-0.5)
+    ax_left.grid(True, alpha=0.3)
+    ax_left.tick_params(axis="x", labelsize=14)
+    ax_left.tick_params(axis="y", labelsize=14)
+    ax_left.legend([l1, l2, l3, l4], [x.get_label() for x in (l1, l2, l3, l4)], fontsize=12, loc="upper left")
+
+    if ax_right is not None:
+        n_values_set = {0}
+        for result in valid_results:
+            if "manyshot_results" in result:
+                for n_demos in result["manyshot_results"].keys():
+                    n_values_set.add(int(n_demos))
+        n_values_sorted = sorted(n_values_set)
+
+        viridis = plt.cm.get_cmap("viridis", max(len(n_values_sorted) - 1, 1))
+        line_colors = []
+        for n in n_values_sorted:
+            if n == 0:
+                line_colors.append("black")
+            else:
+                color_idx = n_values_sorted.index(n) - 1 if 0 in n_values_sorted else n_values_sorted.index(n)
+                if len(n_values_sorted) > 1:
+                    mapped_idx = color_idx / (len(n_values_sorted) - 2) if (len(n_values_sorted) > 2) else 0
+                    line_colors.append(viridis(mapped_idx))
+                else:
+                    line_colors.append(viridis(0))
+
+        for color_idx, n in enumerate(n_values_sorted):
+            token_sums = np.zeros(max_tokens)
+            token_counts = np.zeros(max_tokens)
+            for result in valid_results:
+                if n == 0:
+                    if "alignment_per_token_no_prefix" in result:
+                        align = np.array(result["alignment_per_token_no_prefix"])
+                        token_sums[: len(align)] += align
+                        token_counts[: len(align)] += 1
+                else:
+                    if "manyshot_results" in result and str(n) in result["manyshot_results"]:
+                        align = result["manyshot_results"][str(n)].get("alignment_per_token", [])
+                        if align:
+                            align = np.array(align)
+                            token_sums[: len(align)] += align
+                            token_counts[: len(align)] += 1
+            with np.errstate(invalid="ignore"):
+                avg_alignment = np.where(token_counts > 0, token_sums / token_counts, np.nan)
+            if token_mode == "skip_first" and len(avg_alignment) > 1:
+                avg_alignment = avg_alignment[start_idx:]
+            if smooth_mode == "smooth":
+                valid_mask = ~np.isnan(avg_alignment)
+                if valid_mask.any():
+                    filled = np.copy(avg_alignment)
+                    filled[~valid_mask] = np.interp(
+                        np.flatnonzero(~valid_mask),
+                        np.flatnonzero(valid_mask),
+                        avg_alignment[valid_mask],
+                    )
+                    avg_alignment = smooth_signal(filled, window_size=7)
+            token_positions = np.arange(len(avg_alignment))
+            ax_right.plot(
+                token_positions,
+                avg_alignment,
+                label=f"N={n}",
+                color=line_colors[color_idx],
+                alpha=0.95 if n == 0 else 0.8,
+                linewidth=2.5 if n == 0 else 2,
+                zorder=3 if n == 0 else 2,
+            )
+
+        avg_instr_len = np.mean([r.get("instruction_seq_len", 0) for r in valid_results])
+        vline_pos = avg_instr_len - start_idx if token_mode == "skip_first" else avg_instr_len
+        ax_right.axvline(
+            x=vline_pos, color="red", linestyle="--", alpha=0.9,
+            label=f"Instr ends (~{int(round(avg_instr_len))})",
+        )
+        ax_right.set_xlabel("Token Position", fontsize=17)
+        ax_right.set_ylabel(alignment_label, fontsize=17)
+        ax_right.set_title(f"Average Per-Token {suffix} Across All Instructions", fontsize=17)
+        ax_right.tick_params(axis="x", labelsize=16)
+        ax_right.tick_params(axis="y", labelsize=16)
+        ax_right.grid(True, alpha=0.3)
+        handles, labels = ax_right.get_legend_handles_labels()
+        ax_right.legend(handles[::-1], labels[::-1], loc="upper right", fontsize=11, framealpha=0.5, facecolor="white")
+        all_values = []
+        for line in ax_right.get_lines():
+            ydata = line.get_ydata()
+            if len(ydata) > 0:
+                all_values.extend(ydata)
+        if all_values:
+            ymin, ymax = np.percentile(all_values, [2, 98])
+            margin = (ymax - ymin) * 0.1
+            ax_right.set_ylim(ymin - margin, ymax + margin)
+
+    fig.tight_layout()
+    out_name = f"manyshot_figure4_two_panel_{metric}_{token_mode}_{smooth_mode}.pdf"
+    fig.savefig(os.path.join(output_dir, out_name), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Two-panel Figure-4-style plot saved to: {os.path.join(output_dir, out_name)}")
 
 
 def analyze_results(results_path: str, activations_path: str, metric: str = "l2"):
@@ -1278,6 +1518,11 @@ def analyze_results(results_path: str, activations_path: str, metric: str = "l2"
             plt.close(fig3)
             print(f"Heatmap saved to: {plot3_path}")
     
+    _save_manyshot_figure4_two_panel(
+        valid_results, asr_by_n, output_dir, metric,
+        token_mode="all_tokens", smooth_mode="raw",
+    )
+
     print(f"\nAll plots saved to: {output_dir}")
     
     return {
@@ -1307,8 +1552,13 @@ if __name__ == "__main__":
                         help="Maximum number of demonstrations to load")
     parser.add_argument("--max-new-tokens", type=int, default=512,
                         help="Maximum new tokens for generation")
-    parser.add_argument("--analyze", type=str, default="/src/new_cont/llms/steercheck/invertsteer/outputs/Llama-3.2-1B-Instruct/manyshot/manyshot_results_refusal_actadd_coeff_-1.0.json",
-    # parser.add_argument("--analyze", type=str, default=None,
+    parser.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="NF4 BitsAndBytes load (GPU + bitsandbytes).",
+    )
+    # parser.add_argument("--analyze", type=str, default="/src/new_cont/llms/steercheck/invertsteer/outputs/Llama-3.2-1B-Instruct/manyshot/manyshot_results_refusal_actadd_coeff_-1.0.json",
+    parser.add_argument("--analyze", type=str, default=None,
                         help="Path to results JSON to analyze (skips experiment)")
     args = parser.parse_args()
     
@@ -1329,7 +1579,8 @@ if __name__ == "__main__":
         config.steering_type = args.steering_type
         config.max_new_tokens = args.max_new_tokens
         config.max_demonstrations = args.max_demos
-        
+        config.load_in_4bit = args.load_in_4bit
+
         if args.icl_path:
             config.icl_demonstrations_path = args.icl_path
         

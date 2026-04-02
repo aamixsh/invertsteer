@@ -31,7 +31,7 @@ from inversion import (
     InversionResult,
 )
 
-from model_utils import get_tokenize_fn
+from model_utils import get_tokenize_fn, load_model as load_hf_causal_lm, get_input_device
 
 def replace_last_norm(model_id: str, model: AutoModelForCausalLM):
     attr_name = {
@@ -123,29 +123,23 @@ def load_model(
     model_id: str,
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
+    *,
+    load_in_4bit: bool = False,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    """Load model and tokenizer."""
+    """Load model and tokenizer (shared path with invertsteer ``model_utils.load_model``)."""
+    dtype_str = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }.get(dtype, "float32")
     print(f"Loading model: {model_id}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
+    model, tokenizer = load_hf_causal_lm(
+        model_id, device, dtype_str, load_in_4bit=load_in_4bit
     )
-    model.to(device)
-    
-    # Print model size
     size_in_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    size_in_gb = size_in_bytes / ((2 ** 10) ** 3)
-    print(f'Model memory: {size_in_gb:.2f} GB')
-    
-    # Setup for inference
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+    size_in_gb = size_in_bytes / ((2**10) ** 3)
+    print(f"Model memory (parameter storage): {size_in_gb:.2f} GB")
     torch.set_grad_enabled(True)
-    tokenizer.pad_token = tokenizer.eos_token
-    
     return model, tokenizer
 
 
@@ -193,6 +187,7 @@ def run_inversion(
     continue_on_failure: bool = False,
     top_k: int = 10,
     verbose: bool = True,
+    load_in_4bit: bool = False,
 ) -> tuple[bool, Optional[float], Optional[List[int]], InversionResult]:
     """
     Run prompt inversion attack.
@@ -220,7 +215,7 @@ def run_inversion(
     
     # Load model
     dtype = torch.float32
-    model, tokenizer = load_model(model_id, device, dtype)
+    model, tokenizer = load_model(model_id, device, dtype, load_in_4bit=load_in_4bit)
 
     replace_last_norm(model_id, model)
     
@@ -243,7 +238,7 @@ def run_inversion(
     # Tokenize prompt (without special tokens, we add them separately)
     tokenize_fn = get_tokenize_fn(tokenizer, use_chat_template=use_chat_template, add_special_tokens=add_special_tokens)
     inputs = tokenize_fn(instructions=[prompt])
-    input_ids = inputs.input_ids.to(model.device)
+    input_ids = inputs.input_ids.to(get_input_device(model))
     
     if verbose:
         print(f'Input IDs ({len(input_ids[0])} tokens): {input_ids}')
@@ -268,7 +263,7 @@ def run_inversion(
     
     # Print top-k tokens if requested
     if verbose and result is not None:
-        print_top_k_tokens(result, tokenizer, input_ids_list)
+        print_top_k_tokens(result, tokenizer, input_ids[0].tolist())
     
     return match, time_taken, discovered_ids, result
 
@@ -319,7 +314,12 @@ Examples:
                         help='Number of top candidate tokens to track')
     parser.add_argument('--quiet', action='store_true',
                         help='Reduce output verbosity')
-    
+    parser.add_argument(
+        '--load-in-4bit',
+        action='store_true',
+        help='NF4 BitsAndBytes load (GPU + bitsandbytes).',
+    )
+
     args = parser.parse_args()
     
     match, time_taken, discovered_ids, result = run_inversion(
@@ -336,6 +336,7 @@ Examples:
         continue_on_failure=args.continue_on_failure,
         top_k=args.top_k,
         verbose=not args.quiet,
+        load_in_4bit=args.load_in_4bit,
     )
     
     print("\n" + "="*60)
